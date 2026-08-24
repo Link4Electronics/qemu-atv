@@ -3806,6 +3806,24 @@ static const X86CPUDefinition builtin_x86_defs[] = {
         .cache_info = &legacy_intel_cpuid2_cache_info,
     },
     {
+        .name = "pentium-m",
+        .level = 10,
+        .vendor = CPUID_VENDOR_INTEL,
+        .family = 6,
+        .model = 13,
+        .stepping = 8,
+        .features[FEAT_1_EDX] =
+            PPRO_FEATURES | CPUID_VME |
+            CPUID_MTRR | CPUID_CLFLUSH | CPUID_MCA | CPUID_ACPI |
+            CPUID_SS,
+        .features[FEAT_1_ECX] =
+            CPUID_EXT_SSE3 | CPUID_EXT_MONITOR,
+        .features[FEAT_8000_0001_EDX] =
+            CPUID_EXT2_NX,
+        .xlevel = 0x80000008,
+        .model_id = "Intel(R) Pentium(R) M processor 1.00GHz",
+    },
+    {
         .name = "athlon",
         .level = 2,
         .vendor = CPUID_VENDOR_AMD,

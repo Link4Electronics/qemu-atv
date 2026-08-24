@@ -52,6 +52,8 @@ typedef struct PCMachineState {
     bool i8042_enabled;
     bool default_bus_bypass_iommu;
     bool fd_bootchk;
+    uint64_t car_base;
+    uint64_t car_size;
     uint64_t max_fw_size;
 
     /* ACPI Memory hotplug IO base address */
@@ -68,6 +70,8 @@ typedef struct PCMachineState {
 #define PC_MACHINE_SATA             "sata"
 #define PC_MACHINE_I8042            "i8042"
 #define PC_MACHINE_MAX_FW_SIZE      "max-fw-size"
+#define PC_MACHINE_CAR_BASE         "car-base"
+#define PC_MACHINE_CAR_SIZE         "car-size"
 #define PC_MACHINE_SMBIOS_EP        "smbios-entry-point-type"
 
 /**

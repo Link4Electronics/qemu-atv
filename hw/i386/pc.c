@@ -523,12 +523,103 @@ void pc_acpi_smi_interrupt(void *opaque, int irq, int level)
     }
 }
 
+typedef struct ATVStubState {
+    MemoryRegion tpm;
+    MemoryRegion *nvram;
+    uint32_t sts[5];
+    bool active[5];
+} ATVStubState;
+
+static ATVStubState atv_stub;
+
+static uint64_t atv_tpm_read(void *opaque, hwaddr addr, unsigned size)
+{
+    hwaddr loc = addr >> 12;
+    hwaddr off = addr & 0xfff;
+
+    if (loc >= 5) {
+        return 0;
+    }
+    switch (off) {
+    case 0x00:
+        return 0x80 | (atv_stub.active[loc] ? 0x20 : 0);
+    case 0x18:
+        return atv_stub.sts[loc];
+    case 0x24:
+        return 0;
+    case 0xf00:
+        return 0x000115d1;
+    case 0xf04:
+        return 0x01;
+    default:
+        return 0;
+    }
+}
+
+static void atv_tpm_write(void *opaque, hwaddr addr, uint64_t val,
+                          unsigned size)
+{
+    hwaddr loc = addr >> 12;
+    hwaddr off = addr & 0xfff;
+
+    if (loc >= 5) {
+        return;
+    }
+    switch (off) {
+    case 0x00:
+        if (val & 0x02) {
+            atv_stub.active[loc] = true;
+        } else if (val & 0x20) {
+            atv_stub.active[loc] = false;
+        }
+        break;
+    case 0x18:
+        if (val & 0x04) {
+            atv_stub.sts[loc] = 0x1009;
+        }
+        break;
+    case 0x24:
+        atv_stub.sts[loc] = 0x1011;
+        break;
+    default:
+        break;
+    }
+}
+
+static const MemoryRegionOps atv_tpm_ops = {
+    .read = atv_tpm_read,
+    .write = atv_tpm_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
 static
 void pc_machine_done(Notifier *notifier, void *data)
 {
     PCMachineState *pcms = container_of(notifier,
                                         PCMachineState, machine_done);
     X86MachineState *x86ms = X86_MACHINE(pcms);
+
+    if (atv_stub.nvram != NULL && MACHINE(pcms)->firmware != NULL) {
+        FILE *f = fopen(MACHINE(pcms)->firmware, "rb");
+        size_t sz = memory_region_size(atv_stub.nvram);
+
+        if (f != NULL) {
+            void *p = memory_region_get_ram_ptr(atv_stub.nvram);
+
+            fseek(f, 0, SEEK_END);
+            if (ftell(f) >= (long)sz) {
+                fseek(f, -(long)sz, SEEK_END);
+                if (fread(p, 1, sz, f) == sz) {
+                    memory_region_set_dirty(atv_stub.nvram, 0, sz);
+                }
+            }
+            fclose(f);
+        }
+    }
 
     cxl_hook_up_pxb_registers(pcms->pcibus, &pcms->cxl_devices_state,
                               &error_fatal);
@@ -812,6 +903,44 @@ void pc_memory_init(PCMachineState *pcms,
                                     ram_above_4g);
         e820_add_entry(x86ms->above_4g_mem_start, x86ms->above_4g_mem_size,
                        E820_RAM);
+    }
+
+    if (pcms->car_size > 0) {
+        MemoryRegion *car = g_new(MemoryRegion, 1);
+
+        memory_region_init_ram(car, NULL, "car-ram", pcms->car_size,
+                               &error_fatal);
+        memory_region_add_subregion(system_memory, pcms->car_base, car);
+        e820_add_entry(pcms->car_base, pcms->car_size, E820_RESERVED);
+
+        for (i = 0; i < 5; i++) {
+            atv_stub.sts[i] = 0x1103;
+        }
+        memory_region_init_io(&atv_stub.tpm, OBJECT(pcms), &atv_tpm_ops,
+                              NULL, "atv-tpm-tis", 0x5000);
+        memory_region_add_subregion(system_memory, 0xfed40000,
+                                    &atv_stub.tpm);
+
+        atv_stub.nvram = g_new(MemoryRegion, 1);
+        memory_region_init_ram(atv_stub.nvram, NULL, "atv-nvram", 0x200000,
+                               &error_fatal);
+        memory_region_add_subregion(system_memory, 0xf0000000,
+                                    atv_stub.nvram);
+
+        static const struct { hwaddr base; uint64_t size; const char *name; }
+        mmio_windows[] = {
+            { 0xfed14000, 0x1000, "atv-mchbar" },
+            { 0xfed15000, 0x1000, "atv-dmibar" },
+            { 0xfed1c000, 0x4000, "atv-rcba" },
+        };
+        for (i = 0; i < (int)ARRAY_SIZE(mmio_windows); i++) {
+            MemoryRegion *mr = g_new(MemoryRegion, 1);
+
+            memory_region_init_ram(mr, NULL, mmio_windows[i].name,
+                                   mmio_windows[i].size, &error_fatal);
+            memory_region_add_subregion(system_memory, mmio_windows[i].base,
+                                        mr);
+        }
     }
 
     if (pcms->sgx_epc.size != 0) {
@@ -1640,6 +1769,8 @@ static void pc_machine_initfn(Object *obj)
 #endif
     pcms->fd_bootchk = true;
     pcms->default_bus_bypass_iommu = false;
+    pcms->car_base = 0xfef00000ULL;
+    pcms->car_size = 0;
 
     pc_system_flash_create(pcms);
     pcms->pcspk = isa_new(TYPE_PC_SPEAKER);
@@ -1681,6 +1812,48 @@ static void pc_machine_wakeup(MachineState *machine)
     cpu_synchronize_all_states();
     pc_machine_reset(machine, RESET_TYPE_WAKEUP);
     cpu_synchronize_all_post_reset();
+}
+
+static void pc_machine_get_car_base(Object *obj, Visitor *v, const char *name,
+                                    void *opaque, Error **errp)
+{
+    PCMachineState *pcms = PC_MACHINE(obj);
+    uint64_t value = pcms->car_base;
+
+    visit_type_uint64(v, name, &value, errp);
+}
+
+static void pc_machine_set_car_base(Object *obj, Visitor *v, const char *name,
+                                    void *opaque, Error **errp)
+{
+    PCMachineState *pcms = PC_MACHINE(obj);
+    uint64_t value;
+
+    if (!visit_type_uint64(v, name, &value, errp)) {
+        return;
+    }
+    pcms->car_base = value;
+}
+
+static void pc_machine_get_car_size(Object *obj, Visitor *v, const char *name,
+                                    void *opaque, Error **errp)
+{
+    PCMachineState *pcms = PC_MACHINE(obj);
+    uint64_t value = pcms->car_size;
+
+    visit_type_uint64(v, name, &value, errp);
+}
+
+static void pc_machine_set_car_size(Object *obj, Visitor *v, const char *name,
+                                    void *opaque, Error **errp)
+{
+    PCMachineState *pcms = PC_MACHINE(obj);
+    uint64_t value;
+
+    if (!visit_type_uint64(v, name, &value, errp)) {
+        return;
+    }
+    pcms->car_size = value;
 }
 
 static void pc_machine_class_init(ObjectClass *oc, const void *data)
@@ -1777,6 +1950,18 @@ static void pc_machine_class_init(ObjectClass *oc, const void *data)
         pc_machine_set_fd_bootchk);
     object_class_property_set_description(oc, "fd-bootchk",
         "Enable/disable boot signature checking for floppy disks in BIOS");
+
+    object_class_property_add(oc, PC_MACHINE_CAR_BASE, "uint64",
+        pc_machine_get_car_base, pc_machine_set_car_base,
+        NULL, NULL);
+    object_class_property_set_description(oc, PC_MACHINE_CAR_BASE,
+        "Base address of the cache-as-RAM emulation region");
+
+    object_class_property_add(oc, PC_MACHINE_CAR_SIZE, "size",
+        pc_machine_get_car_size, pc_machine_set_car_size,
+        NULL, NULL);
+    object_class_property_set_description(oc, PC_MACHINE_CAR_SIZE,
+        "Size of the cache-as-RAM emulation region (0 = disabled)");
 
 #if defined(CONFIG_IGVM)
     object_class_property_add_link(oc, "igvm-cfg",
