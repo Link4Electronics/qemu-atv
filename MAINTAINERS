@@ -1862,12 +1862,21 @@ M: Chao Liu <chao.liu@processmission.com>
 L: qemu-riscv@nongnu.org
 S: Maintained
 F: docs/system/riscv/k230.rst
+F: hw/misc/k230_ddr.c
 F: hw/riscv/k230.c
 F: hw/watchdog/k230_wdt.c
+F: hw/dma/k230_gsdma.c
+F: hw/misc/k230_decomp_gzip.c
+F: include/hw/misc/k230_ddr.h
 F: include/hw/riscv/k230.h
 F: include/hw/watchdog/k230_wdt.h
+F: include/hw/dma/k230_gsdma.h
+F: include/hw/misc/k230_decomp_gzip.h
 F: tests/functional/riscv64/test_k230.py
+F: tests/qtest/k230-ddr-test.c
 F: tests/qtest/k230-wdt-test.c
+F: tests/qtest/k230-gsdma-test.c
+F: tests/qtest/k230-decomp-gzip-test.c
 
 RX Machines
 -----------
@@ -1961,10 +1970,15 @@ R: Christian Borntraeger <borntraeger@linux.ibm.com>
 R: Jason Herne <jjherne@linux.ibm.com>
 S: Supported
 F: hw/s390x/ipl.*
+F: hw/s390x/cert-store.[ch]
+F: include/hw/s390x/ipl/
 F: pc-bios/s390-ccw/
 F: pc-bios/s390-ccw.img
 F: docs/devel/s390-dasd-ipl.rst
+F: docs/specs/s390x-secure-ipl.rst
+F: docs/system/s390x/secure-ipl.rst
 F: tests/functional/s390x/test_pxelinux.py
+F: tests/functional/s390x/test_secure_ipl.py
 L: qemu-s390x@nongnu.org
 
 S390 PCI
