@@ -50,6 +50,8 @@
 #include "hw/core/sysbus.h"
 #include "hw/i2c/smbus_eeprom.h"
 #include "system/memory.h"
+
+#define TYPE_ATV_NVIDIA_GPU "atv-nvidia-gpu"
 #include "hw/acpi/acpi.h"
 #include "hw/vfio/types.h"
 #include "qapi/error.h"
@@ -296,7 +298,11 @@ static void pc_init1(MachineState *machine, const char *pci_type)
         x86_register_ferr_irq(x86ms->gsi[13]);
     }
 
-    pc_vga_init(isa_bus, pcms->pcibus);
+    if (pcms->car_size > 0) {
+        pci_create_simple(pcms->pcibus, -1, TYPE_ATV_NVIDIA_GPU);
+    } else {
+        pc_vga_init(isa_bus, pcms->pcibus);
+    }
 
     /* init basic PC hardware */
     pc_basic_device_init(pcms, isa_bus, x86ms->gsi, x86ms->rtc,
@@ -693,7 +699,6 @@ DEFINE_PC_MACHINE(xenfv_4_2, "xenfv-4.2", pc_xen_hvm_init,
  * NVIDIA vendor/device IDs and a framebuffer MMIO window so that the firmware
  * can locate, size and dispatch the adapter it expects.
  */
-#define TYPE_ATV_NVIDIA_GPU "atv-nvidia-gpu"
 OBJECT_DECLARE_SIMPLE_TYPE(ATVNvidiaGPUState, ATV_NVIDIA_GPU)
 
 #define ATV_NVIDIA_DEVICE_G72M 0x01d7   /* GeForce Go 7300 */
@@ -746,7 +751,7 @@ static void atv_nvidia_gpu_realize(PCIDevice *pci_dev, Error **errp)
     pci_register_bar(&s->dev, 2, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mmio);
 }
 
-static void atv_nvidia_gpu_class_init(ObjectClass *klass, void *data)
+static void atv_nvidia_gpu_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
