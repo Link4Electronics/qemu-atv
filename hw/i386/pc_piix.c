@@ -35,6 +35,12 @@
 #include "hw/display/ramfb.h"
 #include "hw/pci/pci.h"
 #include "hw/pci/pci_ids.h"
+#include "hw/pci/pci_device.h"
+#include "hw/core/qdev-properties.h"
+#include "qom/object.h"
+#include "qemu/module.h"
+#include "qemu/bitops.h"
+#include "migration/vmstate.h"
 #include "hw/usb/usb.h"
 #include "net/net.h"
 #include "hw/ide/pci.h"
@@ -236,7 +242,7 @@ static void pc_init1(MachineState *machine, const char *pci_type)
 
     gsi_state = pc_gsi_create(&x86ms->gsi, true);
 
-    pci_dev = pci_new_multifunction(-1, pcms->south_bridge);
+    pci_dev = pci_new_multifunction(PCI_DEVFN(0x1f, 0), pcms->south_bridge);
     object_property_set_bool(OBJECT(pci_dev), "has-usb",
                              machine_usb(machine), &error_abort);
     object_property_set_bool(OBJECT(pci_dev), "has-acpi",
@@ -675,3 +681,101 @@ static void xenfv_machine_4_2_options(MachineClass *m)
 DEFINE_PC_MACHINE(xenfv_4_2, "xenfv-4.2", pc_xen_hvm_init,
                   xenfv_machine_4_2_options);
 #endif
+
+/*
+ * NVIDIA G72M ("m63", GeForce Go 7300) PCI graphics device shim.
+ *
+ * The Apple TV SEC/PEI firmware does not carry a generic VGA driver.  It
+ * enumerates the PCI bus expecting its embedded NVIDIA GPU (vendor 0x10de,
+ * G72M) and hands control to the on-die OptionROM/VBIOS for that part.  QEMU
+ * normally presents a generic "std" VGA (vendor 0x1234), which the firmware
+ * does not dispatch.  Provide a minimal VGA-class PCI device carrying the
+ * NVIDIA vendor/device IDs and a framebuffer MMIO window so that the firmware
+ * can locate, size and dispatch the adapter it expects.
+ */
+#define TYPE_ATV_NVIDIA_GPU "atv-nvidia-gpu"
+OBJECT_DECLARE_SIMPLE_TYPE(ATVNvidiaGPUState, ATV_NVIDIA_GPU)
+
+#define ATV_NVIDIA_DEVICE_G72M 0x01d7   /* GeForce Go 7300 */
+#define ATV_NVIDIA_VRAM_SIZE   0x01000000 /* 16 MiB framebuffer */
+
+struct ATVNvidiaGPUState {
+    PCIDevice dev;
+    MemoryRegion vram;
+    MemoryRegion mmio;
+};
+
+static uint64_t atv_nvidia_mmio_read(void *opaque, hwaddr addr, unsigned size)
+{
+    return 0;
+}
+
+static void atv_nvidia_mmio_write(void *opaque, hwaddr addr, uint64_t val,
+                                  unsigned size)
+{
+}
+
+static const MemoryRegionOps atv_nvidia_mmio_ops = {
+    .read = atv_nvidia_mmio_read,
+    .write = atv_nvidia_mmio_write,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+    .impl.min_access_size = 1,
+    .impl.max_access_size = 4,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
+static void atv_nvidia_gpu_realize(PCIDevice *pci_dev, Error **errp)
+{
+    ATVNvidiaGPUState *s = ATV_NVIDIA_GPU(pci_dev);
+    uint8_t *c = pci_dev->config;
+
+    c[PCI_INTERRUPT_PIN] = 0x01;
+    c[PCI_LATENCY_TIMER] = 0x40;
+
+    memory_region_init_ram(&s->vram, OBJECT(s), "atv-nvidia-vram",
+                           ATV_NVIDIA_VRAM_SIZE, errp);
+    if (*errp) {
+        return;
+    }
+    memory_region_set_log(&s->vram, true, DIRTY_MEMORY_VGA);
+    pci_register_bar(&s->dev, 0, PCI_BASE_ADDRESS_MEM_PREFETCH, &s->vram);
+
+    memory_region_init_io(&s->mmio, OBJECT(s), &atv_nvidia_mmio_ops, s,
+                          "atv-nvidia-mmio", 0x1000000);
+    pci_register_bar(&s->dev, 2, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mmio);
+}
+
+static void atv_nvidia_gpu_class_init(ObjectClass *klass, void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+
+    k->realize = atv_nvidia_gpu_realize;
+    k->vendor_id = PCI_VENDOR_ID_NVIDIA;
+    k->device_id = ATV_NVIDIA_DEVICE_G72M;
+    k->subsystem_vendor_id = PCI_VENDOR_ID_NVIDIA;
+    k->subsystem_id = ATV_NVIDIA_DEVICE_G72M;
+    k->revision = 0xa1;
+    k->class_id = PCI_CLASS_DISPLAY_VGA;
+    set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
+    dc->desc = "Apple TV NVIDIA G72M (GeForce Go 7300) shim";
+}
+
+static const TypeInfo atv_nvidia_gpu_info = {
+    .name          = TYPE_ATV_NVIDIA_GPU,
+    .parent        = TYPE_PCI_DEVICE,
+    .instance_size = sizeof(ATVNvidiaGPUState),
+    .class_init    = atv_nvidia_gpu_class_init,
+    .interfaces = (const InterfaceInfo[]) {
+        { INTERFACE_CONVENTIONAL_PCI_DEVICE },
+        { },
+    },
+};
+
+static void atv_nvidia_gpu_register_types(void)
+{
+    type_register_static(&atv_nvidia_gpu_info);
+}
+
+type_init(atv_nvidia_gpu_register_types)

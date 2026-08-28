@@ -211,6 +211,8 @@ GSIState *pc_gsi_create(qemu_irq **irqs, bool pci_enabled)
 static void ioport80_write(void *opaque, hwaddr addr, uint64_t data,
                            unsigned size)
 {
+    fprintf(stderr, "ATV POST[0x%02lx sz=%u] = 0x%02lx\n",
+            (unsigned long)addr, size, (unsigned long)(data & 0xff));
 }
 
 static uint64_t ioport80_read(void *opaque, hwaddr addr, unsigned size)
@@ -528,9 +530,26 @@ typedef struct ATVStubState {
     MemoryRegion *nvram;
     uint32_t sts[5];
     bool active[5];
+    MemoryRegion mchbar;
+    uint8_t spd_addr;
+    uint32_t mch[0x1000 / 4];
 } ATVStubState;
 
 static ATVStubState atv_stub;
+
+static uint64_t atv_io_read_proxy(void *opaque, hwaddr addr, unsigned size)
+{
+    fprintf(stderr, "ATV IO RD port=0x%03lx size=%u -> 0x00\n",
+            (unsigned long)addr, size);
+    return 0x00;
+}
+
+static void atv_io_write_proxy(void *opaque, hwaddr addr, uint64_t data,
+                               unsigned size)
+{
+    fprintf(stderr, "ATV IO WR port=0x%03lx size=%u = 0x%lx\n",
+            (unsigned long)addr, size, (unsigned long)data);
+}
 
 static uint64_t atv_tpm_read(void *opaque, hwaddr addr, unsigned size)
 {
@@ -596,6 +615,93 @@ static const MemoryRegionOps atv_tpm_ops = {
     },
 };
 
+static uint64_t atv_post_read(void *opaque, hwaddr addr, unsigned size)
+{
+    return 0;
+}
+
+static void atv_post_write(void *opaque, hwaddr addr, uint64_t val,
+                           unsigned size)
+{
+    fprintf(stderr, "ATV POST[0x%02lx sz=%u] = 0x%lx\n",
+            (unsigned long)addr, size, (unsigned long)val);
+}
+
+static const MemoryRegionOps atv_post_ops = {
+    .read = atv_post_read,
+    .write = atv_post_write,
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
+static uint64_t atv_mchbar_read(void *opaque, hwaddr addr, unsigned size)
+{
+    ATVStubState *s = opaque;
+    hwaddr off = addr & 0xfff;
+    uint32_t v;
+
+    switch (off) {
+    case 0x2f8:
+        /* MCHBAR+0x2f8 = RCVENMT (RCVENOUTB master timing/status).
+         * Model a DIMM whose RCVEN train-window is "locked" while the rank
+         * select lives in the low half (bit 7 clear) and closes once the
+         * SEC steps the select into the high half (bit 7 set):
+         *   window open : raw bits 0x10000|0x20000|0x40000|0x80000
+         *                 -> aligned 0x40000 AND 0x80000 set, so the SEC
+         *                    coarse gate, fine (8 consecutive locked
+         *                    samples) and closed-window checks all pass.
+         *   window shut : raw 0x10000|0x40000 -> aligned 0x40000 set only.
+         * The low nibble keeps whatever the firmware programmed. */
+        v = s->mch[off / 4] & 0x0f;
+        if ((s->spd_addr & 0x80) == 0) {
+            v |= 0x000f0000;
+        } else {
+            v |= 0x00050000;
+        }
+        fprintf(stderr, "ATV MCHBAR RD off=0x%03x size=%u -> 0x%08x\n",
+                (unsigned)off, size, v);
+        return v;
+    default:
+        v = s->mch[off / 4];
+        fprintf(stderr, "ATV MCHBAR RD off=0x%03x size=%u -> 0x%08x\n",
+                (unsigned)off, size, v);
+        return v;
+    }
+}
+
+static void atv_mchbar_write(void *opaque, hwaddr addr, uint64_t val,
+                             unsigned size)
+{
+    ATVStubState *s = opaque;
+    hwaddr off = addr & 0xfff;
+
+    switch (off) {
+    case 0x340:
+    case 0x3c0:
+        s->spd_addr = val & 0xff;
+        break;
+    }
+    s->mch[off / 4] = val;
+    fprintf(stderr, "ATV MCHBAR WR off=0x%03x size=%u = 0x%x\n",
+            (unsigned)off, size, (unsigned)val);
+    if (off == 0x340 || off == 0x117 || off == 0x2f8) {
+        fprintf(stderr, "ATV MCHBAR+0x%03x WRITE = 0x%x\n", (unsigned)off,
+                (unsigned)val);
+    }
+}
+
+static const MemoryRegionOps atv_mchbar_ops = {
+    .read = atv_mchbar_read,
+    .write = atv_mchbar_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
 static
 void pc_machine_done(Notifier *notifier, void *data)
 {
@@ -608,17 +714,24 @@ void pc_machine_done(Notifier *notifier, void *data)
         size_t sz = memory_region_size(atv_stub.nvram);
 
         if (f != NULL) {
-            void *p = memory_region_get_ram_ptr(atv_stub.nvram);
-
             fseek(f, 0, SEEK_END);
-            if (ftell(f) >= (long)sz) {
-                fseek(f, -(long)sz, SEEK_END);
-                if (fread(p, 1, sz, f) == sz) {
-                    memory_region_set_dirty(atv_stub.nvram, 0, sz);
-                }
-            }
+            (void)ftell(f);
             fclose(f);
         }
+        (void)sz;
+    }
+
+    {
+        uint8_t *rsm = g_malloc0(0x10000);
+        int i;
+
+        for (i = 0; i < 0x10000; i += 2) {
+            rsm[i] = 0x0f;
+            rsm[i + 1] = 0xaa;
+        }
+        address_space_write(&address_space_memory, 0x30000,
+                            MEMTXATTRS_UNSPECIFIED, rsm, 0x10000);
+        g_free(rsm);
     }
 
     cxl_hook_up_pxb_registers(pcms->pcibus, &pcms->cxl_devices_state,
@@ -926,10 +1039,19 @@ void pc_memory_init(PCMachineState *pcms,
                                &error_fatal);
         memory_region_add_subregion(system_memory, 0xf0000000,
                                     atv_stub.nvram);
+        /* Apple TV SEC: "top of DRAM" byte at 0xf000009c (base 0xf0000000
+         * nvram window, offset 0x9c) is shifted left 24 to yield the DRAM
+         * top-address (0x10 << 24 = 256 MB). Zeroed RAM made this read 0,
+         * underflowing the SEC's descriptor length to 64-bit-max and the
+         * 0x5a5a5a5a sweep ran forever. Seed it with 0x10 for 256 MB. */
+        ((uint8_t *)memory_region_get_ram_ptr(atv_stub.nvram))[0x9c] = 0x10;
 
+        memory_region_init_io(&atv_stub.mchbar, OBJECT(pcms), &atv_mchbar_ops,
+                              &atv_stub, "atv-mchbar", 0x1000);
+        memory_region_add_subregion(system_memory, 0xfed14000,
+                                    &atv_stub.mchbar);
         static const struct { hwaddr base; uint64_t size; const char *name; }
         mmio_windows[] = {
-            { 0xfed14000, 0x1000, "atv-mchbar" },
             { 0xfed15000, 0x1000, "atv-dmibar" },
             { 0xfed1c000, 0x4000, "atv-rcba" },
         };
@@ -1190,6 +1312,28 @@ void pc_basic_device_init(struct PCMachineState *pcms,
     memory_region_init_io(ioportF0_io, OBJECT(pcms), &ioportF0_io_ops, NULL,
                           "ioportF0", 1);
     memory_region_add_subregion(isa_bus->address_space_io, 0xf0, ioportF0_io);
+
+    if (object_property_get_uint(qdev_get_machine(), "car-size", NULL) > 0) {
+        static const MemoryRegionOps atv_io_ops = {
+            .read = atv_io_read_proxy,
+            .write = atv_io_write_proxy,
+            .endianness = DEVICE_LITTLE_ENDIAN,
+            .impl = {
+                .min_access_size = 1,
+                .max_access_size = 1,
+            },
+        };
+        static const int atv_io_ports[] = { 0x300, 0x304, 0xb2, 0x62 };
+        int k;
+
+        for (k = 0; k < ARRAY_SIZE(atv_io_ports); k++) {
+            MemoryRegion *atv_io = g_new(MemoryRegion, 1);
+            memory_region_init_io(atv_io, OBJECT(pcms), &atv_io_ops,
+                                  &atv_stub, "atv-io", 0x1);
+            memory_region_add_subregion(isa_bus->address_space_io,
+                                        atv_io_ports[k], atv_io);
+        }
+    }
 
     /*
      * Check if an HPET shall be created.

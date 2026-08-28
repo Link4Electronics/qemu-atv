@@ -79,6 +79,14 @@ static void i440fx_realize(PCIDevice *dev, Error **errp)
     if (object_property_get_bool(qdev_get_machine(), "iommu", NULL)) {
         warn_report("i440fx doesn't support emulated iommu");
     }
+
+    if (object_property_get_uint(qdev_get_machine(), "car-size", NULL) > 0) {
+        /* Apple TV (945GM MCH) atv mode: reveal the real host-bridge
+         * config register 0xE4 (0xA10A2503, bit 17 set) that the SEC
+         * firmware uses as the "no TPM / skip TPM probe" gate. Without it
+         * the SEC spins forever polling the (absent) TPM at 0xfed40000. */
+        pci_set_long(dev->config + 0xE4, 0xa10a2503);
+    }
 }
 
 static void i440fx_update_memory_mappings(PCII440FXState *d)
@@ -106,10 +114,28 @@ static void i440fx_write_config(PCIDevice *dev,
 
     /* XXX: implement SMRAM.D_LOCK */
     pci_default_write_config(dev, address, val, len);
+    if (object_property_get_uint(qdev_get_machine(), "car-size", NULL) > 0) {
+        fprintf(stderr, "ATV MCH cfg WR off=0x%02x len=%d = 0x%08x\n",
+                address, len, val);
+    }
     if (ranges_overlap(address, len, I440FX_PAM, I440FX_PAM_SIZE) ||
         range_covers_byte(address, len, I440FX_SMRAM)) {
         i440fx_update_memory_mappings(d);
     }
+}
+
+static uint32_t i440fx_read_config(PCIDevice *dev, uint32_t address, int len)
+{
+    uint32_t v = pci_default_read_config(dev, address, len);
+
+    /* ATV debug: log MCH (dev0) config reads the SEC relies on. */
+    if (object_property_get_uint(qdev_get_machine(), "car-size", NULL) > 0) {
+        if (address <= 0x1ff) {
+            fprintf(stderr, "ATV MCH cfg read off=0x%02x len=%d -> 0x%08x\n",
+                    address, len, v);
+        }
+    }
+    return v;
 }
 
 static int i440fx_post_load(void *opaque, int version_id)
@@ -333,6 +359,7 @@ static void i440fx_class_init(ObjectClass *klass, const void *data)
 
     k->realize = i440fx_realize;
     k->config_write = i440fx_write_config;
+    k->config_read = i440fx_read_config;
     k->vendor_id = PCI_VENDOR_ID_INTEL;
     k->device_id = PCI_DEVICE_ID_INTEL_82441;
     k->revision = 0x02;
