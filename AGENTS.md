@@ -154,13 +154,98 @@ Infinite retry loop at `0x0e51b69e`:
   scanning a table; table base from descriptor `[0x0ea139f4]->+0x44` currently
   `0x0ee4cd90`) is a **red herring** — not the blocker.
 
+### Refined diagnosis (`!!` — DXE async protocol-notification wait)
+The livelock is an **EFI DXE driver/protocol-connection wait**, not the DRAM verify.
+- Function F at `0x0e51b5ff` (called from `0x0e51b3a0`) registers an **async protocol
+  notification** via wrapper `0xe526dbf` (which itself does `calll *0x34`/`*0x38` on the
+  protocol instance) for an **opaque EFI handle token** `0x11e1a300` (NOT a parseable
+  RAM pointer — monitor `xp` on it returns "Cannot access memory"). Callback
+  `0xe51b6e2` sets wait-flag `0xe52da44`=1; it never fires → F busy-waits at
+  `0x0e51b69e` on `Stall(1000)` forever.
+- The platform protocol instance is `[0xe52da8c]` = `0x0ee55aa0` — a **large custom/p
+  platform protocol** with a method table reaching offset `0xc0` (Stall lives at `0x88`;
+  also uses `0x30/0x34/0x38/0xbc/0xc0`). Not the plain EFI_CPU_ARCH_PROTOCOL (too many
+  methods); likely Apple/MCP-platform-specific. Live stack frame: `[0x0ee8af24]`=saved
+  EBP `0x0ee8af68`, ret `0x0e51b3a0`, `8(%ebp)`=`0x0ee8af5c`, `0xc(%ebp)`=handle
+  `0x11e1a300`.
+- **NOT an interrupt wait (`!!`)**: live registers at the frozen loop show
+  `EFL=00000002` (**IF=0, interrupts disabled**) and `IDT=00000000 0000ffff` (no real
+  IDT). So no interrupt/timer event can fire to advance the wait. And during the wait the
+  firmware touches ONLY port `0x61` (Stall delay) plus the in-RAM flag — no other port or
+  MMIO poll. → The awaited event is a **synchronous completion callback from a missing
+  DXE driver installing a protocol**, not an IRQ to add.
+- **Apple EFI context**: near the connection code, ROM globals `0x0e52d710-0x0e52d760`
+  hold Apple boot-loader GUIDs — the ASCII strings `427 6f6f 74` ("Boot"), `5265 636f`
+  ("Reco…"), `4846 5300` ("HFS"), etc. So this is the standard Apple EFI boot/loader
+  driver dispatch; the busy-wait is part of Apple's DXE driver connection that on real
+  HW completes because the matched ATV device/driver is present.
+- **Root cause of the hang**: a platform/device DXE driver never installs the awaited
+  protocol because the corresponding ATV1 hardware is absent under QEMU's generic `pc`
+  machine (no MCP/memory-sync notification, missing device, or the matching Apple
+  driver never binds to a present device).
+
+### CONFIRMED via RAM image (`!!` — module identity + awaited protocol)
+Using `pmemsave 0x0e480000 0x100000 /tmp/atv-ram.bin` (written to the QEMU **cwd**,
+e.g. `qemu-atv/ramdump.bin`, NOT /tmp) I found the MZ/PE header of the busy-wait
+module and decoded function F end-to-end:
+- **Module base = `0x0e51b000`** (MZ@dump-off `0x9b000`; ImageBase field `0xe51b000`;
+  PE32, `.text/.rdata/.data/.reloc`, machine 0x14c). The busy-wait `0x0e51b69e` sits at
+  module offset `0x69e`. Recognized strings inside: `Primary Master %s`,
+  `Apple_Recovery`, `BootFFFF`, `Boot0080` → this is an **Apple BDS / boot-picker
+  driver** (boot-device / filesystem selection), not a plain CPU/mem driver.
+- **Protocol GUIDs the driver registers/waits against** (read from RAM globals):
+  `0xe52d794` = `964E5B22-6459-11D2-8E39-00A0C969723B` = **EFI_SIMPLE_FILE_SYSTEM**
+  (EFI-1.x `964e5b21/22` family; `964e5b21`=BLOCK_IO). `0xe52d754` =
+  `8BE4DF61-93CA-11D2-AA0D-00E098032B8C` = **EFI_GLOBAL_VARIABLE** (standard var ns).
+  `0xe52d5c4`=`E121EC07-9C42-45EE-B0B6-FFF8EF03C521`, `0xe52d614`=
+  `35D15D9C-535B-4FCA-A536-2A4E9BE8FBA0` = Apple-custom GUIDs. `0xe52d709+` holds the
+  ASCII "Boot"/"HFS"/"Recovery" strings.
+- Function F (`0x0e51b5ff`) decoded:
+  ```
+  call 0xe526dbf(cb=0xe51b6e2, h=0x11e1a300, ...)  ; wrapper -> prot(*0x34), prot(*0x38)
+  prot=0xe52da8c: call *0x34(push 0x200,0x8,0xe51b6f6,0,&key)   ; cb->flag=2
+                   call *0x60(GUID 0xe52d794=SimpleFileSystem, h, &h2)
+  call 0xe51bc4c(0x8(%ebp)) -> 0x8000000e (NOT_FOUND)
+  wait@0x0e51b69e: while (0xe52da44==0) { prot->Stall(0x3e8) }   ; loop forever
+  ```
+  Callback `0xe51b6e2` sets flag=1; callback `0xe51b6f6` sets flag=2. **Both are async
+  protocol/event notify callbacks that never fire.** No IRQ, no other port/MMIO polled.
+- ⇒ **The driver awaits an install of EFI_SIMPLE_FILE_SYSTEM (a bootable filesystem
+  device), or the platform `*0x34/*0x38/*0x60` notify to fire.** On real ATV a boot
+  device (internal ATA/FireWire/USB disk with HFS) + its FS driver appear; under QEMU's
+  generic `pc` none does, so the notify never fires and BDS spins at POST `0xe4`.
+- Platform protocol instance `[0xe52da8c]` = `0x0ee55aa0`: method table offsets used
+  `*0x30`(free?) `*0x34` `*0x38`(reg-notify) `*0x44`(free) `*0x4c` `*0x60`(open-install
+  by GUID) `*0x88`(Stall) `*0xac`(read cfg struct) `*0xbc`(get next) `*0xc0`(read mem
+  block). It wraps the EFI protocol database with an Apple async-notify layer.
+
 ### Next step (when resuming)
-Identify which device/event the `0xe526dbf` registration is waiting on (the handle
-`0xc(%ebp)` at the `0x0e51b6**` caller, and the protocol `0xe52da8c`), then add QEMU
-emulation for it (its IRQ, an MCH/timer notification, or the missing device). CRITICAL
-gdb warning: do NOT break on the NOT_FOUND return path expecting a single hit — it
-fires every retry iteration and will hang gdb/KVM. Prefer reading the live handle +
-protocol via the monitor (`xp` on the globals) or a sparse breakpoint with a timeout.
+Goal is now concrete: make the awaited EFI_SIMPLE_FILE_SYSTEM / boot-device notify fire
+(or bypass the wait). Ideas in priority order:
+1. **Add a bootable block device** to the QEMU `pc` machine (e.g. an IDE/i440FX ATA disk
+   on the ATV stub, or a USB/FireWire virtual disk) + the matching EFI FS driver, so BDS
+   sees a filesystem. Simplest first try: attach a small HFS/EFI-partitioned virtio/ATA
+   disk and see if BDS proceeds past `0xe4`.
+2. If a disk alone doesn't bind (Apple driver looks for a specific ATV device path),
+   instrument `pc_memory_init`/ATV stub (`pc.c`) to **log the platform `*0x34/*0x60`
+   protocol-registration GUIDs live** (the `ATV_DEBUG_NVRAM` style knob) to confirm the
+   exact awaited GUID right at freeze, then emulate that device's "ready" signal.
+3. Failing that, patch the firmware's wait (`0xe52da44` init to non-zero) only as an
+   experiment to see how far it gets — do NOT rely on it as the fix.
+
+### Next step (when resuming)
+Narrow which ATV1 **device/driver** the DXE connection is waiting for, then add QEMU
+emulation for it (its IRQ / a memory-sync / the missing device). Concrete leads:
+- The registrations build on handle `0x11e1a300` and protocol `0x0ee55aa0`; trace
+  F's caller `0x0e51b3a0` and the `0x0e51b2e0` driver-connection routine (uses globals
+  `0xe52da4c`/`0xe52da90`, `*0x38`/`*0xc0`) to find the expected GUID. Read that GUID
+  by dumping the protocol database / the args pushed at the registration sites
+  (`0x0e51b613`, `0x0e51b73d`).
+- gdb-under-KVM is too slow to catch the registration (it races to the loop). Under
+  **TCG** (`-accel tcg -cpu pentium-m`) gdbstub is faster; still race-prone. Prefer
+  reading the live handle/protocol/GUID via the monitor, or instrument QEMU to log the
+  registration. AGENTS warns: do NOT break on the NOT_FOUND return path (fires every
+  retry, hangs gdb/KVM).
 
 ## Reference addresses / data seen (firmware, running from RAM)
 
