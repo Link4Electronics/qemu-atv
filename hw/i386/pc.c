@@ -528,6 +528,10 @@ void pc_acpi_smi_interrupt(void *opaque, int irq, int level)
 typedef struct ATVStubState {
     MemoryRegion tpm;
     MemoryRegion *nvram;
+    MemoryRegion nvram_io;
+    uint8_t *nvram_ptr;
+    hwaddr nvlog_off;
+    unsigned nvlog_count;
     uint32_t sts[5];
     bool active[5];
     MemoryRegion mchbar;
@@ -550,6 +554,42 @@ static void atv_io_write_proxy(void *opaque, hwaddr addr, uint64_t data,
     fprintf(stderr, "ATV IO WR port=0x%03lx size=%u = 0x%lx\n",
             (unsigned long)addr, size, (unsigned long)data);
 }
+
+static uint64_t atv_nvram_read(void *opaque, hwaddr addr, unsigned size)
+{
+    ATVStubState *s = opaque;
+    uint64_t v = 0;
+
+    if (s->nvram_ptr != NULL) {
+        memcpy(&v, s->nvram_ptr + addr, size);
+    }
+    if (s->nvlog_off != addr && s->nvlog_count > 0) {
+        s->nvlog_off = addr;
+        s->nvlog_count = 8;
+    }
+    if (s->nvlog_count > 0) {
+        s->nvlog_count--;
+        fprintf(stderr, "ATV MCHBAR1 RD off=0x%03lx size=%u -> 0x%llx\n",
+                (unsigned long)addr, size, (unsigned long long)v);
+    }
+    return v;
+}
+
+static void atv_nvram_write(void *opaque, hwaddr addr, uint64_t val,
+                            unsigned size)
+{
+    ATVStubState *s = opaque;
+
+    if (s->nvram_ptr != NULL) {
+        memcpy(s->nvram_ptr + addr, &val, size);
+    }
+}
+
+static const MemoryRegionOps atv_nvram_ops = {
+    .read = atv_nvram_read,
+    .write = atv_nvram_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
 
 static uint64_t atv_tpm_read(void *opaque, hwaddr addr, unsigned size)
 {
@@ -713,10 +753,32 @@ void pc_machine_done(Notifier *notifier, void *data)
         FILE *f = fopen(MACHINE(pcms)->firmware, "rb");
         size_t sz = memory_region_size(atv_stub.nvram);
 
+        /* 0xf0000000 (MCHBAR1) is the on-die NVRAM/config store.  Load it
+         * from the whole flash dump (ATV_NVRAM=flash) or present it as an
+         * erased NVRAM (ATV_NVRAM=erase, the default).  Either way the 0x9c
+         * "top of DRAM" byte must be 0x10 (SEC shifts it left 24 to size
+         * DRAM; a zero underflows and the pattern sweep runs forever). */
         if (f != NULL) {
-            fseek(f, 0, SEEK_END);
-            (void)ftell(f);
+            if (getenv("ATV_NVRAM") != NULL &&
+                strcmp(getenv("ATV_NVRAM"), "flash") == 0) {
+                fseek(f, 0, SEEK_END);
+                if (ftell(f) >= (long)sz) {
+                    rewind(f);
+                    if (fread(atv_stub.nvram_ptr, 1, sz, f) != sz) {
+                        memset(atv_stub.nvram_ptr, 0xff, sz);
+                    }
+                } else {
+                    memset(atv_stub.nvram_ptr, 0xff, sz);
+                }
+            } else {
+                memset(atv_stub.nvram_ptr, 0xff, sz);
+            }
             fclose(f);
+            {
+                const char *td = getenv("ATV_TOPDRAM");
+                long tv = td ? strtol(td, NULL, 0) : 0x10;
+                atv_stub.nvram_ptr[0x9c] = (uint8_t)tv;
+            }
         }
         (void)sz;
     }
@@ -1037,14 +1099,26 @@ void pc_memory_init(PCMachineState *pcms,
         atv_stub.nvram = g_new(MemoryRegion, 1);
         memory_region_init_ram(atv_stub.nvram, NULL, "atv-nvram", 0x200000,
                                &error_fatal);
-        memory_region_add_subregion(system_memory, 0xf0000000,
-                                    atv_stub.nvram);
+        atv_stub.nvram_ptr = memory_region_get_ram_ptr(atv_stub.nvram);
+        memory_region_init_io(&atv_stub.nvram_io, OBJECT(pcms),
+                              &atv_nvram_ops,
+                              &atv_stub, "atv-mchbar1", 0x200000);
+        memory_region_add_subregion_overlap(system_memory, 0xf0000000,
+                                            &atv_stub.nvram_io, 1);
         /* Apple TV SEC: "top of DRAM" byte at 0xf000009c (base 0xf0000000
          * nvram window, offset 0x9c) is shifted left 24 to yield the DRAM
          * top-address (0x10 << 24 = 256 MB). Zeroed RAM made this read 0,
          * underflowing the SEC's descriptor length to 64-bit-max and the
-         * 0x5a5a5a5a sweep ran forever. Seed it with 0x10 for 256 MB. */
-        ((uint8_t *)memory_region_get_ram_ptr(atv_stub.nvram))[0x9c] = 0x10;
+         * 0x5a5a5a5a sweep ran forever. Seed it with 0x10 for 256 MB (real
+         * ATV usable DRAM tops out near 0x0ff00000; ATV_TOPDRAM overrides). */
+        {
+            const char *td = getenv("ATV_TOPDRAM");
+            long tv = td ? strtol(td, NULL, 0) : 0x10;
+            atv_stub.nvram_ptr[0x9c] = (uint8_t)tv;
+        }
+        if (getenv("ATV_DEBUG_NVRAM") != NULL) {
+            atv_stub.nvlog_count = 0x7fffffff;
+        }
 
         memory_region_init_io(&atv_stub.mchbar, OBJECT(pcms), &atv_mchbar_ops,
                               &atv_stub, "atv-mchbar", 0x1000);
@@ -1130,7 +1204,15 @@ void pc_memory_init(PCMachineState *pcms,
         } else {
             memory_region_init_ram(option_rom_mr, NULL, "pc.rom", PC_ROM_SIZE,
                                 &error_fatal);
-            if (pcmc->pci_enabled) {
+            /*
+             * ATV (NVIDIA) config: the early-PEI DRAM pattern test writes and
+             * verifies through physical 0xc0000 (the start of its large
+             * type-7 RAM range).  A stock pc machine maps 0xc0000-0xdffff as a
+             * read-only option-ROM region, silently dropping those writes and
+             * causing the verify to fail (0x80000007) and the mem-map to retry
+             * forever.  Keep the region writable for the ATV firmware.
+             */
+            if (pcmc->pci_enabled && pcms->car_size == 0) {
                 memory_region_set_readonly(option_rom_mr, true);
             }
         }

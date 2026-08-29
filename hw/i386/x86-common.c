@@ -32,6 +32,7 @@
 #include "trace.h"
 
 #include "hw/i386/x86.h"
+#include "hw/i386/pc.h"
 #include "target/i386/cpu.h"
 #include "hw/rtc/mc146818rtc.h"
 #include "target/i386/sev.h"
@@ -1108,8 +1109,31 @@ void x86_bios_rom_init(X86MachineState *x86ms, const char *default_firmware,
 
     if (!machine_require_guest_memfd(MACHINE(x86ms))) {
         /* map the last 128KB of the BIOS in ISA space */
-        x86_isa_bios_init(&x86ms->isa_bios, rom_memory, &x86ms->bios,
-                          !isapc_ram_fw);
+        bool atv = PC_MACHINE(x86ms)->car_size > 0;
+        if (atv) {
+            /*
+             * ATV (NVIDIA) config: the low 0xE0000-0xFFFFF window must be
+             * writable RAM for the EFI DRAM pattern test.  On a stock pc
+             * machine this is a read-only alias to the last 128KB of the
+             * firmware (also mapped at 0xFFFE0000-0xFFFFFFFF); making that
+             * alias writable would let the pattern writes to low 0xE0000
+             * zero the running firmware image at the top of memory.  Instead,
+             * give the ATV its own dedicated RAM window pre-loaded with the
+             * last 128KB of the firmware, decoupled from the high mapping.
+             */
+            memory_region_init_ram(&x86ms->isa_bios, NULL, "isa-bios-ram",
+                                   128 * KiB, &error_fatal);
+            memcpy(memory_region_get_ram_ptr(&x86ms->isa_bios),
+                   memory_region_get_ram_ptr(&x86ms->bios)
+                       + bios_size - 128 * KiB,
+                   128 * KiB);
+            memory_region_add_subregion_overlap(rom_memory,
+                                                1 * MiB - 128 * KiB,
+                                                &x86ms->isa_bios, 1);
+        } else {
+            x86_isa_bios_init(&x86ms->isa_bios, rom_memory, &x86ms->bios,
+                              !isapc_ram_fw);
+        }
     }
 
     /* map all the bios at the top of memory */

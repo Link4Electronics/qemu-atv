@@ -71,7 +71,16 @@ static void pc_isa_bios_init(PCMachineState *pcms, MemoryRegion *isa_bios,
            isa_bios_size);
 
     if (!machine_require_guest_memfd(current_machine)) {
-        memory_region_set_readonly(isa_bios, true);
+        /*
+         * ATV (NVIDIA) config: the early-PEI DRAM pattern test writes through
+         * the whole 1MB-low region including 0xe0000-0xfffff.  A stock pc
+         * machine shadows that as read-only isa-bios BIOS ROM, silently
+         * dropping the writes so the DRAM verify fails and the firmware retries
+         * forever.  Keep it writable RAM for the ATV firmware.
+         */
+        if (pcms->car_size == 0) {
+            memory_region_set_readonly(isa_bios, true);
+        }
     }
 }
 
