@@ -32,6 +32,7 @@
 #include "hw/pci/pci.h"
 #include "hw/ide/piix.h"
 #include "hw/ide/pci.h"
+#include "hw/i386/pc.h"
 #include "ide-internal.h"
 #include "trace.h"
 
@@ -153,8 +154,23 @@ static void pci_piix_ide_realize(PCIDevice *dev, Error **errp)
 {
     PCIIDEState *d = PCI_IDE(dev);
     uint8_t *pci_conf = dev->config;
+    PCMachineState *pcms = PC_MACHINE(qdev_get_machine());
+    bool atv = pcms && object_dynamic_cast(OBJECT(pcms), TYPE_PC_MACHINE) &&
+               pcms->car_size > 0;
 
-    pci_conf[PCI_CLASS_PROG] = 0x80; // legacy ATA mode
+    if (atv) {
+        /* Real Apple TV uses the ICH7-M (82801GBM) IDE controller:
+         * 8086:27df, prog-if 0x8f (native + ISA-compat channels, bus mastering).
+         * QEMU's PIIX3 IDE is reused for the legacy-ATA datapath (0x1f0/IRQ14) so
+         * the firmware/ata_piix storage stack sees a controller it recognizes. */
+        pci_conf[PCI_VENDOR_ID] = PCI_VENDOR_ID_INTEL & 0xff;
+        pci_conf[PCI_VENDOR_ID + 1] = (PCI_VENDOR_ID_INTEL >> 8) & 0xff;
+        pci_conf[PCI_DEVICE_ID] = 0xdf;
+        pci_conf[PCI_DEVICE_ID + 1] = 0x27;
+        pci_conf[PCI_CLASS_PROG] = 0x8f; /* native mode, ISA-compat channels */
+    } else {
+        pci_conf[PCI_CLASS_PROG] = 0x80; // legacy ATA mode
+    }
 
     bmdma_setup_bar(d);
     pci_register_bar(dev, 4, PCI_BASE_ADDRESS_SPACE_IO, &d->bmdma_bar);
