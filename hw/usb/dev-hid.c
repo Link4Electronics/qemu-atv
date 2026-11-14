@@ -60,6 +60,11 @@ enum {
     STR_SERIAL_MOUSE,
     STR_SERIAL_TABLET,
     STR_SERIAL_KEYBOARD,
+    /* ATV: Apple built-in IR receiver (05ac:8241) + a keyboard-style HID
+     * so the firmware's "armt"/AppleHidInterface drivers match the remote. */
+    STR_PRODUCT_IR,
+    STR_CONFIG_IR,
+    STR_SERIAL_IR,
 };
 
 static const USBDescStrings desc_strings = {
@@ -74,6 +79,9 @@ static const USBDescStrings desc_strings = {
     [STR_SERIAL_MOUSE]     = "89126",
     [STR_SERIAL_TABLET]    = "28754",
     [STR_SERIAL_KEYBOARD]  = "68284",
+    [STR_PRODUCT_IR]       = "Apple TV Remote IR Receiver",
+    [STR_CONFIG_IR]        = "HID Keyboard",
+    [STR_SERIAL_IR]        = "1ATVREV1",
 };
 
 static const USBDescIface desc_iface_mouse = {
@@ -446,6 +454,41 @@ static const USBDesc desc_keyboard2 = {
         .iManufacturer     = STR_MANUFACTURER,
         .iProduct          = STR_PRODUCT_KEYBOARD,
         .iSerialNumber     = STR_SERIAL_KEYBOARD,
+    },
+    .full = &desc_device_keyboard,
+    .high = &desc_device_keyboard2,
+    .str  = desc_strings,
+    .msos = &desc_msos_suspend,
+};
+
+/* ATV: Apple built-in IR receiver (USB VID 0x05ac / PID 0x8241).  The
+ * firmware's "armt" (A7A1EC06) platform driver only installs protocol
+ * 9C5DD135-5B53-4FCA-A536-2A4E9BE8FBA0 (which DuetBds phase-2 busy-waits
+ * on) after it probes a device whose vendor==0x05ac and product==0x8241.
+ * This HID device presents exactly that identity (modelled on the keyboard
+ * HID so the AppleHidInterface multimedia-keys driver can bind too). */
+static const USBDesc desc_ir = {
+    .id = {
+        .idVendor          = 0x05ac,
+        .idProduct         = 0x8241,
+        .bcdDevice         = 0,
+        .iManufacturer     = STR_MANUFACTURER,
+        .iProduct          = STR_PRODUCT_IR,
+        .iSerialNumber     = STR_SERIAL_IR,
+    },
+    .full = &desc_device_keyboard,
+    .str  = desc_strings,
+    .msos = &desc_msos_suspend,
+};
+
+static const USBDesc desc_ir2 = {
+    .id = {
+        .idVendor          = 0x05ac,
+        .idProduct         = 0x8241,
+        .bcdDevice         = 0,
+        .iManufacturer     = STR_MANUFACTURER,
+        .iProduct          = STR_PRODUCT_IR,
+        .iSerialNumber     = STR_SERIAL_IR,
     },
     .full = &desc_device_keyboard,
     .high = &desc_device_keyboard2,
@@ -862,6 +905,40 @@ static const TypeInfo usb_keyboard_info = {
     .class_init    = usb_keyboard_class_initfn,
 };
 
+static void usb_ir_realize(USBDevice *dev, Error **errp)
+{
+    usb_hid_initfn(dev, HID_KEYBOARD, &desc_ir, &desc_ir2, errp);
+}
+
+static const VMStateDescription vmstate_usb_ir = {
+    .name = "atv-ir",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_USB_DEVICE(dev, USBHIDState),
+        VMSTATE_HID_KEYBOARD_DEVICE(hid, USBHIDState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static void usb_ir_class_initfn(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    USBDeviceClass *uc = USB_DEVICE_CLASS(klass);
+
+    uc->realize        = usb_ir_realize;
+    uc->product_desc   = "Apple TV IR Receiver";
+    dc->vmsd = &vmstate_usb_ir;
+    device_class_set_props(dc, usb_keyboard_properties);
+    set_bit(DEVICE_CATEGORY_INPUT, dc->categories);
+}
+
+static const TypeInfo usb_ir_info = {
+    .name          = "atv-ir",
+    .parent        = TYPE_USB_HID,
+    .class_init    = usb_ir_class_initfn,
+};
+
 static void usb_hid_register_types(void)
 {
     type_register_static(&usb_hid_type_info);
@@ -871,6 +948,7 @@ static void usb_hid_register_types(void)
     usb_legacy_register("usb-mouse", "mouse", NULL);
     type_register_static(&usb_keyboard_info);
     usb_legacy_register("usb-kbd", "keyboard", NULL);
+    type_register_static(&usb_ir_info);
 }
 
 type_init(usb_hid_register_types)

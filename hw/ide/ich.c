@@ -105,14 +105,17 @@ static void pci_ich9_ahci_update_irq(void *opaque, int irq_num, int level)
 
 static void pci_ich9_reset(DeviceState *dev)
 {
-    AHCIPCIState *d = ICH9_AHCI(dev);
+    /* ich9-ahci and ich7m-ahci share AHCIPCIState with PCIDevice at offset
+     * 0, so use container_of (not the type-asserting ICH9_AHCI cast) to
+     * serve either subtype. */
+    AHCIPCIState *d = container_of(PCI_DEVICE(dev), AHCIPCIState, parent_obj);
 
     ahci_reset(&d->ahci);
 }
 
 static void pci_ich9_ahci_init(Object *obj)
 {
-    AHCIPCIState *d = ICH9_AHCI(obj);
+    AHCIPCIState *d = container_of(PCI_DEVICE(obj), AHCIPCIState, parent_obj);
 
     qemu_init_irq_child(obj, "update-irq", &d->irq,
                         pci_ich9_ahci_update_irq, d, 0);
@@ -125,7 +128,7 @@ static void pci_ich9_ahci_realize(PCIDevice *dev, Error **errp)
     AHCIPCIState *d;
     int sata_cap_offset;
     uint8_t *sata_cap;
-    d = ICH9_AHCI(dev);
+    d = container_of(dev, AHCIPCIState, parent_obj);
     int ret;
 
     d->ahci.ports = 6;
@@ -170,7 +173,7 @@ static void pci_ich9_ahci_realize(PCIDevice *dev, Error **errp)
 static void pci_ich9_uninit(PCIDevice *dev)
 {
     AHCIPCIState *d;
-    d = ICH9_AHCI(dev);
+    d = container_of(dev, AHCIPCIState, parent_obj);
 
     msi_uninit(dev);
     ahci_uninit(&d->ahci);
@@ -184,7 +187,7 @@ static void ich_ahci_class_init(ObjectClass *klass, const void *data)
     k->realize = pci_ich9_ahci_realize;
     k->exit = pci_ich9_uninit;
     k->vendor_id = PCI_VENDOR_ID_INTEL;
-    k->device_id = PCI_DEVICE_ID_INTEL_82801IR;
+    k->device_id = *(const uint16_t *)data;
     k->revision = 0x02;
     k->class_id = PCI_CLASS_STORAGE_SATA;
     dc->vmsd = &vmstate_ich9_ahci;
@@ -192,12 +195,29 @@ static void ich_ahci_class_init(ObjectClass *klass, const void *data)
     set_bit(DEVICE_CATEGORY_STORAGE, dc->categories);
 }
 
+static const uint16_t ich9_ahci_did = PCI_DEVICE_ID_INTEL_82801IR;
+static const uint16_t ich7m_ahci_did = PCI_DEVICE_ID_INTEL_ICH7M_AHCI;
+
 static const TypeInfo ich_ahci_info = {
     .name          = TYPE_ICH9_AHCI,
     .parent        = TYPE_PCI_DEVICE,
     .instance_size = sizeof(AHCIPCIState),
     .instance_init = pci_ich9_ahci_init,
     .class_init    = ich_ahci_class_init,
+    .class_data    = &ich9_ahci_did,
+    .interfaces = (const InterfaceInfo[]) {
+        { INTERFACE_CONVENTIONAL_PCI_DEVICE },
+        { },
+    },
+};
+
+static const TypeInfo ich7m_ahci_info = {
+    .name          = TYPE_ICH7M_AHCI,
+    .parent        = TYPE_PCI_DEVICE,
+    .instance_size = sizeof(AHCIPCIState),
+    .instance_init = pci_ich9_ahci_init,
+    .class_init    = ich_ahci_class_init,
+    .class_data    = &ich7m_ahci_did,
     .interfaces = (const InterfaceInfo[]) {
         { INTERFACE_CONVENTIONAL_PCI_DEVICE },
         { },
@@ -207,6 +227,7 @@ static const TypeInfo ich_ahci_info = {
 static void ich_ahci_register_types(void)
 {
     type_register_static(&ich_ahci_info);
+    type_register_static(&ich7m_ahci_info);
 }
 
 type_init(ich_ahci_register_types)

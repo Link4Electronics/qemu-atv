@@ -13,6 +13,7 @@
 
 #define TYPE_ICH9_AHCI "ich9-ahci"
 OBJECT_DECLARE_SIMPLE_TYPE(AHCIPCIState, ICH9_AHCI)
+#define TYPE_ICH7M_AHCI "ich7m-ahci"
 
 struct AHCIPCIState {
     PCIDevice parent_obj;

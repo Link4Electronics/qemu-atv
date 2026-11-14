@@ -81,11 +81,26 @@ static void i440fx_realize(PCIDevice *dev, Error **errp)
     }
 
     if (object_property_get_uint(qdev_get_machine(), "car-size", NULL) > 0) {
+        const char *hb = getenv("ATV_HB_ID");
+        unsigned long hb_id = hb ? strtoul(hb, NULL, 0) : 0x27a0;
+
         /* Apple TV (945GM MCH) atv mode: reveal the real host-bridge
          * config register 0xE4 (0xA10A2503, bit 17 set) that the SEC
          * firmware uses as the "no TPM / skip TPM probe" gate. Without it
          * the SEC spins forever polling the (absent) TPM at 0xfed40000. */
         pci_set_long(dev->config + 0xE4, 0xa10a2503);
+
+        /* The firmware's PEIM matches the 945GM MCH (8086:27a0) and only
+         * then builds the PCI root-bridge HOB.  With a plain i440FX ID
+         * (8086:1237) PciHostBridgeDxe registers EFI_PCI_ROOT_BRIDGE_IO
+         * but installs no instance, so the bus is never enumerated and no
+         * storage driver can ever bind.  ATV_HB_ID=0 restores the stock ID
+         * for A/B comparison. */
+        if (hb_id != 0) {
+            pci_config_set_vendor_id(dev->config, PCI_VENDOR_ID_INTEL);
+            pci_config_set_device_id(dev->config, (uint16_t)hb_id);
+            dev->config[PCI_REVISION_ID] = 0x03;
+        }
     }
 }
 
