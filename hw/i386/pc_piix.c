@@ -723,40 +723,130 @@ DEFINE_PC_MACHINE(xenfv_4_2, "xenfv-4.2", pc_xen_hvm_init,
 #endif
 
 /*
- * NVIDIA G72M ("m63", GeForce Go 7300) PCI graphics device shim.
+ * NVIDIA G72M ("m63", GeForce Go 7300) PCI graphics device.
  *
- * The Apple TV SEC/PEI firmware does not carry a generic VGA driver.  It
- * enumerates the PCI bus expecting its embedded NVIDIA GPU (vendor 0x10de,
- * G72M) and hands control to the on-die OptionROM/VBIOS for that part.  QEMU
- * normally presents a generic "std" VGA (vendor 0x1234), which the firmware
- * does not dispatch.  Provide a minimal VGA-class PCI device carrying the
- * NVIDIA vendor/device IDs and a framebuffer MMIO window so that the firmware
- * can locate, size and dispatch the adapter it expects.
+ * The Apple TV SEC/PEI firmware does not carry a generic VGA driver: it
+ * enumerates the PCI bus expecting its embedded NVIDIA GPU (10de:01d7) and
+ * hands control to its own NVIDIA UGA driver, which carries a copy of the
+ * board VBIOS.  The register/BAR layout below mirrors the real machine
+ * (atv-devicetree `lspci`, GPU on bus 01 behind the 00:01.0 PCIe port):
+ *
+ *   0x10  BAR0  16 MiB   registers
+ *   0x14  BAR1 256 MiB   64-bit prefetchable VRAM aperture
+ *   0x1c  BAR3  16 MiB   64-bit instance/pramin window
+ *   0x30  ROM  128 KiB   m63 VBIOS (ATV_GPU_ROM=<file>)
+ *
+ * Register accesses are modelled sparsely (last value written wins, a few
+ * power-on defaults) and can be logged verbatim with ATV_GPU_LOG=<file>,
+ * which is how the driver's init/mode-set sequence is reverse engineered.
  */
 OBJECT_DECLARE_SIMPLE_TYPE(ATVNvidiaGPUState, ATV_NVIDIA_GPU)
 
 #define ATV_NVIDIA_DEVICE_G72M 0x01d7   /* GeForce Go 7300 */
-#define ATV_NVIDIA_VRAM_SIZE   0x01000000 /* 16 MiB framebuffer */
+#define ATV_NVIDIA_CHIPSET     0x0460   /* NV46 / G72M, PMC_BOOT_0[20:27] */
+#define ATV_NVIDIA_REGS_SIZE   0x01000000  /* 16 MiB  BAR0  */
+#define ATV_NVIDIA_FB_SIZE     0x10000000  /* 256 MiB BAR1  */
+#define ATV_NVIDIA_INST_SIZE   0x01000000  /* 16 MiB  BAR3  */
+#define ATV_NVIDIA_REG_SLOTS   8192
+#define ATV_NVIDIA_LOG_MAX     400000
+
+typedef struct ATVNvidiaReg {
+    uint32_t addr;
+    uint32_t val;
+} ATVNvidiaReg;
 
 struct ATVNvidiaGPUState {
     PCIDevice dev;
-    MemoryRegion vram;
-    MemoryRegion mmio;
+    MemoryRegion regs;
+    MemoryRegion fb;
+    MemoryRegion inst;
+    ATVNvidiaReg reg[ATV_NVIDIA_REG_SLOTS];
+    FILE *log;
+    unsigned nlog;
+    bool cfgdbg;
 };
 
-static uint64_t atv_nvidia_mmio_read(void *opaque, hwaddr addr, unsigned size)
+static void atv_nvidia_log(ATVNvidiaGPUState *s, char op, hwaddr addr,
+                           unsigned size, uint64_t val)
 {
-    return 0;
+    if (!s->log || s->nlog >= ATV_NVIDIA_LOG_MAX) {
+        return;
+    }
+    fprintf(s->log, "%c %06x %u %08x\n", op, (unsigned)addr, size,
+            (unsigned)val);
+    if (++s->nlog == ATV_NVIDIA_LOG_MAX) {
+        fprintf(s->log, "# log limit reached\n");
+        fflush(s->log);
+    }
 }
 
-static void atv_nvidia_mmio_write(void *opaque, hwaddr addr, uint64_t val,
+/* Sparse 16 MiB register file: addr == ~0 marks a free slot. */
+static ATVNvidiaReg *atv_nvidia_slot(ATVNvidiaGPUState *s, uint32_t addr)
+{
+    unsigned i = (addr >> 2) % ATV_NVIDIA_REG_SLOTS;
+
+    while (s->reg[i].addr != 0xFFFFFFFF) {
+        if (s->reg[i].addr == addr) {
+            return &s->reg[i];
+        }
+        if (++i == ATV_NVIDIA_REG_SLOTS) {
+            i = 0;
+        }
+    }
+    return &s->reg[i];
+}
+
+static uint32_t atv_nvidia_reg32(ATVNvidiaGPUState *s, uint32_t addr)
+{
+    ATVNvidiaReg *r = atv_nvidia_slot(s, addr);
+
+    if (r->addr == 0xFFFFFFFF) {
+        /* power-on values the driver keys off before it writes anything */
+        switch (addr) {
+        case 0x000000:                  /* PMC_BOOT_0 */
+            return (ATV_NVIDIA_CHIPSET << 20) | 0xA1;
+        case 0x001000:                  /* PBUS_DEVID */
+            return 0x046001d7;
+        default:
+            return 0;
+        }
+    }
+    return r->val;
+}
+
+static uint64_t atv_nvidia_regs_read(void *opaque, hwaddr addr, unsigned size)
+{
+    ATVNvidiaGPUState *s = opaque;
+    uint32_t waddr = addr & ~3u;
+    uint32_t val = atv_nvidia_reg32(s, waddr) >> ((addr & 3) * 8);
+    uint64_t ret;
+
+    if (size < 4) {
+        val &= (1u << (size * 8)) - 1;
+    }
+    ret = val;
+    atv_nvidia_log(s, 'r', addr, size, ret);
+    return ret;
+}
+
+static void atv_nvidia_regs_write(void *opaque, hwaddr addr, uint64_t val,
                                   unsigned size)
 {
+    ATVNvidiaGPUState *s = opaque;
+    uint32_t waddr = addr & ~3u;
+    unsigned shift = (addr & 3) * 8;
+    uint32_t mask = (size >= 4) ? 0xFFFFFFFFu : ((1u << (size * 8)) - 1) << shift;
+    ATVNvidiaReg *r = atv_nvidia_slot(s, waddr);
+    uint32_t cur = (r->addr == 0xFFFFFFFF) ? atv_nvidia_reg32(s, waddr) : r->val;
+
+    r->addr = waddr;
+    r->val = (cur & ~mask) | ((uint32_t)val << shift & mask);
+    atv_nvidia_log(s, 'w', addr, size, val);
 }
 
-static const MemoryRegionOps atv_nvidia_mmio_ops = {
-    .read = atv_nvidia_mmio_read,
-    .write = atv_nvidia_mmio_write,
+static const MemoryRegionOps atv_nvidia_regs_ops = {
+    .read = atv_nvidia_regs_read,
+    .write = atv_nvidia_regs_write,
     .valid.min_access_size = 1,
     .valid.max_access_size = 4,
     .impl.min_access_size = 1,
@@ -768,21 +858,149 @@ static void atv_nvidia_gpu_realize(PCIDevice *pci_dev, Error **errp)
 {
     ATVNvidiaGPUState *s = ATV_NVIDIA_GPU(pci_dev);
     uint8_t *c = pci_dev->config;
+    const char *logpath = getenv("ATV_GPU_LOG");
+    const char *rom = getenv("ATV_GPU_ROM");
+    unsigned i;
 
     c[PCI_INTERRUPT_PIN] = 0x01;
     c[PCI_LATENCY_TIMER] = 0x40;
 
-    memory_region_init_ram(&s->vram, OBJECT(s), "atv-nvidia-vram",
-                           ATV_NVIDIA_VRAM_SIZE, errp);
+    for (i = 0; i < ATV_NVIDIA_REG_SLOTS; i++) {
+        s->reg[i].addr = 0xFFFFFFFF;
+    }
+    if (logpath && *logpath) {
+        s->log = fopen(logpath, "w");
+        if (s->log) {
+            setvbuf(s->log, NULL, _IOLBF, 0);
+        }
+    }
+    s->cfgdbg = getenv("ATV_GPU_DEBUG") != NULL;
+
+    memory_region_init_io(&s->regs, OBJECT(s), &atv_nvidia_regs_ops, s,
+                          "atv-nvidia-regs", ATV_NVIDIA_REGS_SIZE);
+    pci_register_bar(&s->dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->regs);
+
+    memory_region_init_ram(&s->fb, OBJECT(s), "atv-nvidia-vram",
+                           ATV_NVIDIA_FB_SIZE, errp);
     if (*errp) {
         return;
     }
-    memory_region_set_log(&s->vram, true, DIRTY_MEMORY_VGA);
-    pci_register_bar(&s->dev, 0, PCI_BASE_ADDRESS_MEM_PREFETCH, &s->vram);
+    memory_region_set_log(&s->fb, true, DIRTY_MEMORY_VGA);
+    pci_register_bar(&s->dev, 1, PCI_BASE_ADDRESS_MEM_PREFETCH |
+                                  PCI_BASE_ADDRESS_MEM_TYPE_64, &s->fb);
 
-    memory_region_init_io(&s->mmio, OBJECT(s), &atv_nvidia_mmio_ops, s,
-                          "atv-nvidia-mmio", 0x1000000);
-    pci_register_bar(&s->dev, 2, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mmio);
+    memory_region_init_ram(&s->inst, OBJECT(s), "atv-nvidia-inst",
+                           ATV_NVIDIA_INST_SIZE, errp);
+    if (*errp) {
+        return;
+    }
+    pci_register_bar(&s->dev, 3, PCI_BASE_ADDRESS_MEM_TYPE_64, &s->inst);
+
+    /* pci_qdev_realize() loads the ROM bar contents after this hook runs */
+    if (rom && *rom) {
+        pci_dev->romfile = g_strdup(rom);
+    }
+
+    if (getenv("ATV_GPU_DEBUG")) {
+        error_report("atv-nvidia-gpu realize end: BAR0=%08x BAR1=%08x BAR3=%08x",
+                     pci_get_long(c + PCI_BASE_ADDRESS_0),
+                     pci_get_long(c + PCI_BASE_ADDRESS_1),
+                     pci_get_long(c + PCI_BASE_ADDRESS_3));
+    }
+}
+
+/*
+ * The ATV firmware never allocates PCI resources: the root bridge reports an
+ * empty resource list and the PciHostBridgeResourceAllocation protocol is
+ * absent, so the bus driver sizes each BAR (write ~0, read back the mask) and
+ * then restores what it read - which is 0 unless the device came up with the
+ * BARs already programmed.  Seed them here, in reset, with the values a real
+ * ATV1 boot leaves in the GPU (atv-devicetree lspci):
+ *
+ *   0x21000000  16 MiB   registers
+ *   0x10000000  256 MiB  framebuffer aperture (64-bit prefetchable)
+ *   0x20000000  16 MiB   instance window (64-bit)
+ *
+ * The restore-write then re-creates the mappings, which is why this has to go
+ * through pci_default_write_config() and not a raw poke of the config space.
+ */
+#define ATV_NVIDIA_REG_BASE  0x21000000
+#define ATV_NVIDIA_FB_BASE   0x10000000
+#define ATV_NVIDIA_INST_BASE 0x20000000
+
+static const struct {
+    uint8_t off;
+    uint32_t value;     /* type bits included, as PCI config wants them */
+} atv_nvidia_bars[] = {
+    { PCI_BASE_ADDRESS_0, ATV_NVIDIA_REG_BASE },
+    { PCI_BASE_ADDRESS_1, ATV_NVIDIA_FB_BASE | PCI_BASE_ADDRESS_MEM_PREFETCH |
+                          PCI_BASE_ADDRESS_MEM_TYPE_64 },
+    { PCI_BASE_ADDRESS_2, 0 },                      /* BAR1 upper half */
+    { PCI_BASE_ADDRESS_3, ATV_NVIDIA_INST_BASE | PCI_BASE_ADDRESS_MEM_TYPE_64 },
+    { PCI_BASE_ADDRESS_4, 0 },                      /* BAR3 upper half */
+};
+
+static void atv_nvidia_bars_program(PCIDevice *d)
+{
+    unsigned i;
+
+    /*
+     * The addresses alone are not enough: pci_bar_address() reports every
+     * memory BAR unmapped while PCI_COMMAND has decode off
+     * (hw/pci/pci.c: `if (!(cmd & PCI_COMMAND_MEMORY)) return PCI_BAR_UNMAPPED`).
+     * On the real machine the platform store hands the firmware a PCI resource
+     * list, so its bus driver both assigns the windows *and* enables decode.
+     * Here the root bridge reports an empty resource list, so nothing ever sets
+     * the bits and the GPU's MMIO never becomes visible to the firmware - which
+     * is why the m63 driver ran its whole Start() path without a single
+     * register access.  Seed the decode bits together with the addresses.
+     */
+    pci_default_write_config(d, PCI_COMMAND,
+                             PCI_COMMAND_IO | PCI_COMMAND_MEMORY |
+                             PCI_COMMAND_MASTER, 2);
+    for (i = 0; i < ARRAY_SIZE(atv_nvidia_bars); i++) {
+        pci_default_write_config(d, atv_nvidia_bars[i].off,
+                                 atv_nvidia_bars[i].value, 4);
+    }
+}
+
+static void atv_nvidia_gpu_reset(DeviceState *dev)
+{
+    atv_nvidia_bars_program(PCI_DEVICE(dev));
+}
+
+/*
+ * The bus driver sizes every BAR (write ~0, read back the mask) and then
+ * writes back whatever it saved.  Because it has no resources to hand out,
+ * that saved value is 0 and every device ends up with no MMIO window at all.
+ * Let the sizing probe through (PciBus needs the size) but restore the real
+ * ATV addresses for any other BAR write, so the windows stay mapped the way
+ * they are on the real machine.
+ */
+static void atv_nvidia_config_write(PCIDevice *d, uint32_t addr, uint32_t val,
+                                    int len)
+{
+    ATVNvidiaGPUState *s = ATV_NVIDIA_GPU(d);
+    bool probe = (len == 4 && val == 0xFFFFFFFF);
+    bool hit = false;
+    unsigned i;
+
+    if (s->cfgdbg && (ranges_overlap(addr, len, PCI_COMMAND, 2) ||
+                      ranges_overlap(addr, len, PCI_BASE_ADDRESS_0, 0x18))) {
+        error_report("atv-gpu cfg w off=%02x val=%0*x len=%d cmd=%04x",
+                     addr, len * 2, val, len,
+                     pci_get_word(d->config + PCI_COMMAND));
+    }
+    pci_default_write_config(d, addr, val, len);
+
+    for (i = 0; i < ARRAY_SIZE(atv_nvidia_bars); i++) {
+        if (ranges_overlap(addr, len, atv_nvidia_bars[i].off, 4)) {
+            hit = true;
+        }
+    }
+    if (hit && !probe) {
+        atv_nvidia_bars_program(d);
+    }
 }
 
 static void atv_nvidia_gpu_class_init(ObjectClass *klass, const void *data)
@@ -791,12 +1009,14 @@ static void atv_nvidia_gpu_class_init(ObjectClass *klass, const void *data)
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
 
     k->realize = atv_nvidia_gpu_realize;
+    k->config_write = atv_nvidia_config_write;
     k->vendor_id = PCI_VENDOR_ID_NVIDIA;
     k->device_id = ATV_NVIDIA_DEVICE_G72M;
     k->subsystem_vendor_id = PCI_VENDOR_ID_NVIDIA;
     k->subsystem_id = ATV_NVIDIA_DEVICE_G72M;
     k->revision = 0xa1;
     k->class_id = PCI_CLASS_DISPLAY_VGA;
+    device_class_set_legacy_reset(dc, atv_nvidia_gpu_reset);
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
     dc->desc = "Apple TV NVIDIA G72M (GeForce Go 7300) shim";
 }
