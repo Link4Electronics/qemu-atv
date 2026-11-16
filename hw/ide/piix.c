@@ -104,6 +104,14 @@ static void bmdma_setup_bar(PCIIDEState *d)
     }
 }
 
+static bool piix_ide_is_atv(void)
+{
+    PCMachineState *pcms = PC_MACHINE(qdev_get_machine());
+
+    return pcms && object_dynamic_cast(OBJECT(pcms), TYPE_PC_MACHINE) &&
+           pcms->car_size > 0;
+}
+
 static void piix_ide_reset(DeviceState *dev)
 {
     PCIIDEState *d = PCI_IDE(dev);
@@ -119,7 +127,25 @@ static void piix_ide_reset(DeviceState *dev)
     pci_set_word(pci_conf + PCI_COMMAND, 0x0000);
     pci_set_word(pci_conf + PCI_STATUS,
                  PCI_STATUS_DEVSEL_MEDIUM | PCI_STATUS_FAST_BACK);
-    pci_set_long(pci_conf + 0x20, 0x1);  /* BMIBA: 20-23h */
+    if (piix_ide_is_atv()) {
+        /*
+         * Apple TV: emulate the ICH7-M IDE function (8086:27df) as the real
+         * firmware leaves it.  The ATV firmware's Ide driver reads the four
+         * channel BARs and builds the command/control port table from them
+         * (it uses the native-mode branch because prog-if has bit0/bit2 set);
+         * with the BARs reading 0 it rejects the controller with
+         * EFI_UNSUPPORTED and no disk is ever probed.  A real BIOS/firmware
+         * has these programmed to the legacy ATA addresses, and BMIBA holds
+         * the bus-master base (0xc000).
+         */
+        pci_set_long(pci_conf + 0x10, 0x1f1);
+        pci_set_long(pci_conf + 0x14, 0x3f5);
+        pci_set_long(pci_conf + 0x18, 0x171);
+        pci_set_long(pci_conf + 0x1c, 0x375);
+        pci_set_long(pci_conf + 0x20, 0xc001);
+    } else {
+        pci_set_long(pci_conf + 0x20, 0x1);  /* BMIBA: 20-23h */
+    }
 }
 
 static bool pci_piix_init_bus(PCIIDEState *d, unsigned i, Error **errp)
@@ -154,9 +180,7 @@ static void pci_piix_ide_realize(PCIDevice *dev, Error **errp)
 {
     PCIIDEState *d = PCI_IDE(dev);
     uint8_t *pci_conf = dev->config;
-    PCMachineState *pcms = PC_MACHINE(qdev_get_machine());
-    bool atv = pcms && object_dynamic_cast(OBJECT(pcms), TYPE_PC_MACHINE) &&
-               pcms->car_size > 0;
+    bool atv = piix_ide_is_atv();
 
     if (atv) {
         /* Real Apple TV uses the ICH7-M (82801GBM) IDE controller:
