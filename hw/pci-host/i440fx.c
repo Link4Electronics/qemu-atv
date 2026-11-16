@@ -28,6 +28,7 @@
 #include "hw/i386/pc.h"
 #include "hw/pci/pci.h"
 #include "hw/pci/pci_host.h"
+#include "hw/pci/pcie_host.h"
 #include "hw/pci-host/i440fx.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/sysbus.h"
@@ -64,6 +65,10 @@ struct I440FXState {
 #define I440FX_PAM_SIZE 7
 #define I440FX_SMRAM    0x72
 
+/* Apple TV (945GM MCH) MMCONFIG registers in the host bridge. */
+#define ATV_PCIEXBAR    0x48
+#define ATV_TOP_OF_MEM  0x9c
+
 /* Keep it 2G to comply with older win32 guests */
 #define I440FX_PCI_HOST_HOLE64_SIZE_DEFAULT (1ULL << 31)
 
@@ -71,6 +76,122 @@ struct I440FXState {
  * exist in real hardware, to get the RAM size from QEMU.
  */
 #define I440FX_COREBOOT_RAM_SIZE 0x57
+
+/*
+ * Apple TV (945GM MCH) MMCONFIG / ECAM window.
+ *
+ * PCIEXBAR (00:00.0 offset 0x48) decodes as: bit 0 = enable, bits 2:1 =
+ * window size (0b00 256 MB, 0b01 128 MB, 0b10 64 MB, 0b11 32 MB), bits
+ * 31:size_shift = base.  The ATV firmware programs 0xf0000005 (64 MB at
+ * 0xf0000000) and from then on performs EVERY PCI config access as a
+ * memory access at base + (bus << 20) + (dev << 15) + (fn << 12) + reg
+ * instead of going through CF8/CFC.  Without this window the accesses
+ * land on the erased atv-nvram stub, every device reads back 0xff and
+ * the bus scan discovers nothing.
+ */
+static PCIDevice *atv_mmcfg_dev(PCII440FXState *s, hwaddr addr)
+{
+    return pci_find_device(pci_get_bus(&s->parent_obj),
+                           PCIE_MMCFG_BUS(addr), PCIE_MMCFG_DEVFN(addr));
+}
+
+static uint64_t atv_mmcfg_read(void *opaque, hwaddr addr, unsigned len)
+{
+    PCII440FXState *s = opaque;
+    PCIDevice *dev = atv_mmcfg_dev(s, addr);
+    uint32_t off = PCIE_MMCFG_CONFOFFSET(addr);
+    uint64_t v;
+
+    if (dev == NULL) {
+        v = ~0x0;
+    } else {
+        v = pci_host_config_read_common(dev, off, pci_config_size(dev), len);
+    }
+    if (getenv("ATV_DEBUG_MMCFG") != NULL) {
+        fprintf(stderr, "ATV MMCFG RD %03x:%02x.%x %03x len=%u -> 0x%llx\n",
+                (unsigned)PCIE_MMCFG_BUS(addr),
+                (unsigned)(PCIE_MMCFG_DEVFN(addr) >> 3),
+                (unsigned)(PCIE_MMCFG_DEVFN(addr) & 7), (unsigned)off, len,
+                (unsigned long long)v);
+    }
+    return v;
+}
+
+static void atv_mmcfg_write(void *opaque, hwaddr addr, uint64_t val,
+                            unsigned len)
+{
+    PCII440FXState *s = opaque;
+    PCIDevice *dev = atv_mmcfg_dev(s, addr);
+    uint32_t off = PCIE_MMCFG_CONFOFFSET(addr);
+
+    if (getenv("ATV_DEBUG_MMCFG") != NULL) {
+        fprintf(stderr, "ATV MMCFG WR %03x:%02x.%x %03x len=%u = 0x%llx\n",
+                (unsigned)PCIE_MMCFG_BUS(addr),
+                (unsigned)(PCIE_MMCFG_DEVFN(addr) >> 3),
+                (unsigned)(PCIE_MMCFG_DEVFN(addr) & 7), (unsigned)off, len,
+                (unsigned long long)val);
+    }
+    if (dev == NULL) {
+        return;
+    }
+    pci_host_config_write_common(dev, off, pci_config_size(dev), val, len);
+}
+
+static const MemoryRegionOps atv_mmcfg_ops = {
+    .read = atv_mmcfg_read,
+    .write = atv_mmcfg_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
+static void atv_mmcfg_update(PCII440FXState *s)
+{
+    uint32_t bar = pci_default_read_config(&s->parent_obj, ATV_PCIEXBAR, 4);
+    hwaddr size = 256 * MiB;
+    bool enable = bar & 1;
+
+    if (getenv("ATV_MMCFG_OFF") != NULL) {
+        enable = false;
+    }
+
+    switch ((bar >> 1) & 3) {
+    case 0:
+        size = 256 * MiB;
+        break;
+    case 1:
+        size = 128 * MiB;
+        break;
+    case 2:
+        size = 64 * MiB;
+        break;
+    case 3:
+        size = 32 * MiB;
+        break;
+    }
+
+    memory_region_transaction_begin();
+    if (s->atv_mmcfg_mapped) {
+        memory_region_del_subregion(get_system_memory(), &s->atv_mmcfg);
+        s->atv_mmcfg_mapped = false;
+    }
+    if (s->atv_mmcfg_size != size) {
+        memory_region_set_size(&s->atv_mmcfg, size);
+        s->atv_mmcfg_size = size;
+    }
+    if (enable) {
+        s->atv_mmcfg_base = bar & ~(size - 1);
+        memory_region_add_subregion_overlap(get_system_memory(),
+                                            s->atv_mmcfg_base,
+                                            &s->atv_mmcfg, 2);
+        s->atv_mmcfg_mapped = true;
+    }
+    memory_region_transaction_commit();
+
+    if (getenv("ATV_DEBUG_MMCFG") != NULL) {
+        fprintf(stderr, "ATV MMCONFIG %s base=0x%08" HWADDR_PRIx
+                " size=0x%" HWADDR_PRIx "\n",
+                enable ? "on" : "off", s->atv_mmcfg_base, size);
+    }
+}
 
 static void i440fx_realize(PCIDevice *dev, Error **errp)
 {
@@ -81,14 +202,31 @@ static void i440fx_realize(PCIDevice *dev, Error **errp)
     }
 
     if (object_property_get_uint(qdev_get_machine(), "car-size", NULL) > 0) {
+        PCII440FXState *f = I440FX_PCI_DEVICE(dev);
         const char *hb = getenv("ATV_HB_ID");
         unsigned long hb_id = hb ? strtoul(hb, NULL, 0) : 0x27a0;
+        const char *td = getenv("ATV_TOPDRAM");
+        long top_dram = td ? strtol(td, NULL, 0) : 0x10;
 
         /* Apple TV (945GM MCH) atv mode: reveal the real host-bridge
          * config register 0xE4 (0xA10A2503, bit 17 set) that the SEC
          * firmware uses as the "no TPM / skip TPM probe" gate. Without it
          * the SEC spins forever polling the (absent) TPM at 0xfed40000. */
         pci_set_long(dev->config + 0xE4, 0xa10a2503);
+
+        /* The SEC sizes DRAM from the byte at 00:00.0 offset 0x9c (the
+         * "top of memory" value, shifted left 24).  Real ATV1 hardware
+         * reads 0x10 there for 256 MB and the firmware itself writes the
+         * same byte back later; seed it so the read works before that.
+         * This is the same byte the legacy atv-nvram stub used to fake. */
+        dev->config[ATV_TOP_OF_MEM] = (uint8_t)top_dram;
+
+        /* The firmware reaches all PCI config space through MMCONFIG,
+         * so the window has to exist before the first PCIEXBAR write. */
+        memory_region_init_io(&f->atv_mmcfg, OBJECT(dev), &atv_mmcfg_ops, f,
+                              "atv-mmcfg", 256 * MiB);
+        f->atv_mmcfg_size = 256 * MiB;
+        atv_mmcfg_update(f);
 
         /* The firmware's PEIM matches the 945GM MCH (8086:27a0) and only
          * then builds the PCI root-bridge HOB.  With a plain i440FX ID
@@ -132,6 +270,9 @@ static void i440fx_write_config(PCIDevice *dev,
     if (object_property_get_uint(qdev_get_machine(), "car-size", NULL) > 0) {
         fprintf(stderr, "ATV MCH cfg WR off=0x%02x len=%d = 0x%08x\n",
                 address, len, val);
+        if (ranges_overlap(address, len, ATV_PCIEXBAR, 4)) {
+            atv_mmcfg_update(d);
+        }
     }
     if (ranges_overlap(address, len, I440FX_PAM, I440FX_PAM_SIZE) ||
         range_covers_byte(address, len, I440FX_SMRAM)) {
@@ -159,6 +300,27 @@ static int i440fx_post_load(void *opaque, int version_id)
 
     i440fx_update_memory_mappings(d);
     return 0;
+}
+
+/*
+ * Apple TV (car-size > 0) platform reset.
+ *
+ * The SEC reset entry programs PCIEXBAR=0xe0000001 and then reads
+ * 00:00.0 offset 0xdc; a non-zero value makes it issue another CF9
+ * global reset, so a stale register loops the machine forever.  On real
+ * hardware both PCIEXBAR and 0xdc come back as zero from PLTRST, so
+ * model that here (QEMU's generic PCI reset only clears the standard
+ * header words).
+ */
+static void i440fx_reset(DeviceState *dev)
+{
+    PCII440FXState *f = I440FX_PCI_DEVICE(dev);
+
+    if (object_property_get_uint(qdev_get_machine(), "car-size", NULL) > 0) {
+        pci_set_long(f->parent_obj.config + ATV_PCIEXBAR, 0);
+        pci_set_long(f->parent_obj.config + 0xdc, 0);
+        atv_mmcfg_update(f);
+    }
 }
 
 static const VMStateDescription vmstate_i440fx = {
@@ -381,6 +543,7 @@ static void i440fx_class_init(ObjectClass *klass, const void *data)
     k->class_id = PCI_CLASS_BRIDGE_HOST;
     dc->desc = "Host bridge";
     dc->vmsd = &vmstate_i440fx;
+    device_class_set_legacy_reset(dc, i440fx_reset);
     /*
      * PCI-facing part of the host bridge, not usable without the
      * host-facing part, which can't be device_add'ed, yet.

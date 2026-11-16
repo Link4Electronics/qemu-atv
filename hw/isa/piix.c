@@ -119,6 +119,16 @@ static void piix_write_config(PCIDevice *dev, uint32_t address, uint32_t val,
                               int len)
 {
     pci_default_write_config(dev, address, val, len);
+    if (object_property_get_uint(qdev_get_machine(), "car-size", NULL) > 0) {
+        /* Apple TV: the ATV PEI sets GEN_PMCON_2 bit 2 (SMBus reset) through
+         * the MMCONFIG window and then reads it back to decide whether a
+         * platform reset is still pending.  On the real ICH7 that bit is a
+         * self-clearing command, but QEMU's PIIX3 latches it, which traps
+         * the firmware in an endless CF9 reset loop. */
+        if (ranges_overlap(address, len, 0xa2, 1)) {
+            dev->config[0xa2] &= ~0x04;
+        }
+    }
     if (ranges_overlap(address, len, PIIX_PIRQCA, 4)) {
         PIIXState *s = PIIX_PCI_DEVICE(dev);
         int pic_irq;

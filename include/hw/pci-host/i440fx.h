@@ -30,6 +30,16 @@ struct PCII440FXState {
     PAMMemoryRegion pam_regions[PAM_REGIONS_COUNT];
     MemoryRegion smram_region;
     MemoryRegion smram, low_smram;
+
+    /* Apple TV (car-size > 0): PCI Express MMCONFIG/ECAM window driven by
+     * the MCH PCIEXBAR register (00:00.0 offset 0x48).  The 945GM firmware
+     * reaches all PCI config space through it (no CF8/CFC after PEI), so
+     * without it every device reads back as 0xff and the bus scan finds
+     * nothing. */
+    MemoryRegion atv_mmcfg;
+    hwaddr atv_mmcfg_base;
+    hwaddr atv_mmcfg_size;
+    bool atv_mmcfg_mapped;
 };
 
 #define TYPE_IGD_PASSTHROUGH_I440FX_PCI_DEVICE "igd-passthrough-i440FX"
