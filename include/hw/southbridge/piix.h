@@ -84,7 +84,6 @@ int piix_atv_slot_pirq(int slot, int pin);
 /* Build the $PIR (PCI IRQ Routing Table v1.0) matching the above wiring.
  * Returns the table size in bytes; @buf must hold PIIX_ATV_PIR_TABLE_SIZE. */
 #define PIIX_ATV_PIR_TABLE_SIZE  (32 + 31 * 16)
-size_t piix_atv_build_pir_table(uint8_t *buf);
 
 /*
  * Where the router publishes that table: the top of the F-segment, which every

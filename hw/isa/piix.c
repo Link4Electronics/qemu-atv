@@ -227,7 +227,7 @@ static void piix_atv_update_routing(PIIXState *s, uint32_t address, int len)
  * byte as a config offset ("PIIX/ICH" router) and leaves the router alone when
  * the register already names a usable IRQ.
  */
-size_t piix_atv_build_pir_table(uint8_t *buf)
+static void piix_atv_build_pir_table(uint8_t *buf)
 {
     const uint8_t irq_of[PIIX_ATV_NUM_PIRQS] = PIIX_ATV_PIRQ_DEFAULT;
     uint32_t sum = 0;
@@ -274,7 +274,6 @@ size_t piix_atv_build_pir_table(uint8_t *buf)
         sum += buf[i];
     }
     buf[PIIX_ATV_PIR_TABLE_SIZE - 1] = (uint8_t)(0x100 - (sum & 0xff));
-    return PIIX_ATV_PIR_TABLE_SIZE;
 }
 
 /*
