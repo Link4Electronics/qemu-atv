@@ -103,6 +103,22 @@ static int pc_pci_slot_get_pirq(PCIDevice *pci_dev, int pci_intx)
     return (pci_intx + slot_addend) & 3;
 }
 
+/*
+ * ATV1 slot -> PIRQ wiring, straight from the firmware's DSDT _PRT (see
+ * piix_atv_slot_pirq[]); slots the board does not route keep the stock
+ * i440FX swizzle.
+ */
+static int pc_atv_slot_get_pirq(PCIDevice *pci_dev, int pci_intx)
+{
+    int slot = PCI_SLOT(pci_dev->devfn);
+    int pirq = -1;
+
+    if (pci_bus_num(pci_get_bus(pci_dev)) == 0 && slot < 32) {
+        pirq = piix_atv_slot_pirq(slot, pci_intx);
+    }
+    return pirq >= 0 ? pirq : pc_pci_slot_get_pirq(pci_dev, pci_intx);
+}
+
 static void piix_intx_routing_notifier_xen(PCIDevice *dev)
 {
     int i;
@@ -271,6 +287,11 @@ static void pc_init1(MachineState *machine, const char *pci_type)
     object_property_set_bool(OBJECT(pci_dev), "smm-enabled",
                              x86_machine_is_smm_enabled(x86ms),
                              &error_abort);
+    /* ATV: the board's (ICH7-M) LPC function carries the eight-line PIRQ
+     * router; see the ATV block below for its slot wiring and the $PIR
+     * table the guest OS finds in the F-segment. */
+    object_property_set_bool(OBJECT(pci_dev), "atv-pirq",
+                             pcms->car_size > 0, &error_abort);
     dev = DEVICE(pci_dev);
     for (i = 0; i < ISA_NUM_IRQS; i++) {
         qdev_connect_gpio_out_named(dev, "isa-irqs", i, x86ms->gsi[i]);
@@ -314,6 +335,21 @@ static void pc_init1(MachineState *machine, const char *pci_type)
     if (pcms->car_size > 0) {
         PCIDevice *uhci;
         DeviceState *uhci_dev;
+
+        /*
+         * Interrupt routing: map the bus the way the firmware's own DSDT
+         * _PRT does, which is what a BIOS on a PIC-only machine would leave
+         * behind.  Without this the guest OS gets no PCI interrupts at all
+         * (the stock PIIX3 leaves every PIRQ "APIC only" and there is no
+         * IO-APIC description for a guest to find).  The south bridge itself
+         * publishes the matching $PIR table into the F-segment; see
+         * PIIX_ATV_PIR_TABLE_ADDR for why that cannot happen at reset.
+         */
+        for (i = 0; i < PIIX_ATV_NUM_PIRQS; i++) {
+            qdev_connect_gpio_out_named(DEVICE(pci_dev), "atv-pirq-apic", i,
+                                        x86ms->gsi[PIIX_ATV_PIRQ_APIC_BASE + i]);
+        }
+        pci_bus_map_irqs(pcms->pcibus, pc_atv_slot_get_pirq);
 
         pci_create_simple(pcms->pcibus, -1, TYPE_ATV_NVIDIA_GPU);
 

@@ -34,6 +34,8 @@
 #include "hw/ide/piix.h"
 #include "hw/intc/i8259.h"
 #include "hw/isa/isa.h"
+#include "system/address-spaces.h"
+#include "system/memory.h"
 #include "system/runstate.h"
 #include "migration/vmstate.h"
 #include "hw/acpi/acpi_aml_interface.h"
@@ -103,6 +105,217 @@ static PCIINTxRoute piix_route_intx_pin_to_irq(void *opaque, int pin)
     return route;
 }
 
+/*
+ * ATV/ICH7 PIRQ router.
+ *
+ * The real board's LPC function has eight PIRQ route registers and wires each
+ * PIRQ line to both interrupt controllers: the IO-APIC sees it on the fixed
+ * GSI 16+n, the 8259 sees it on the ISA IRQ named in the register (bit 7 set
+ * means "PIC path disabled").  QEMU's stock PIIX3 only implements four lines
+ * and only the 8259 half, which is why an ATV guest that has not discovered an
+ * IO-APIC (no MADT, no MP table - exactly the current bring-up state) gets no
+ * PCI interrupts: 0x60..0x63 hold 0x80 after reset, i.e. everything is
+ * "APIC only" and the PIC mapping resolves to nothing.
+ */
+/*
+ * The ATV DSDT's _PRT, per slot (its entries wildcard the PCI function, which
+ * is why this is slot-granular - the same granularity a $PIR table has).
+ * Slots missing from this table are not wired on the board.
+ */
+static const struct {
+    uint8_t slot;
+    int8_t pin[4];
+} atv_pirq_wiring[] = {
+    /*        INTA  INTB  INTC  INTD */
+    { 0x01, {  0,   -1,   -1,   -1 } },  /* PCIe root port (GPU behind it) */
+    { 0x02, {  0,   -1,   -1,   -1 } },  /* "IGD"/NIC slot */
+    { 0x07, {  0,   -1,   -1,   -1 } },  /* performance counters */
+    { 0x1b, {  6,   -1,   -1,   -1 } },  /* HDA */
+    { 0x1c, {  1,    0,    2,    3 } },  /* PCIe ports 1..4 */
+    { 0x1d, {  5,    3,    2,    0 } },  /* UHCI0/1/2, EHCI */
+    { 0x1e, {  6,    4,   -1,   -1 } },  /* PCI/PCI-X bridge */
+    { 0x1f, {  2,    3,   -1,    0 } },  /* LPC, IDE, SATA, SMBus */
+};
+
+int piix_atv_slot_pirq(int slot, int pin)
+{
+    int i;
+
+    for (i = 0; i < ARRAY_SIZE(atv_pirq_wiring); i++) {
+        if (atv_pirq_wiring[i].slot == slot) {
+            return atv_pirq_wiring[i].pin[pin];
+        }
+    }
+    return PIIX_ATV_SLOT_PIRQ_INVALID;
+}
+static uint8_t piix_atv_pirq_rout(PIIXState *s, int pirq)
+{
+    return s->dev.config[PIIX_ATV_PIRQCA + pirq];
+}
+
+/* Level of one ISA IRQ line as the OR of every PIRQ routed to it. */
+static void piix_atv_update_pic(PIIXState *s, int pic_irq)
+{
+    PCIBus *bus = pci_get_bus(&s->dev);
+    int i, level = 0;
+
+    for (i = 0; i < PIIX_ATV_NUM_PIRQS; i++) {
+        uint8_t rout = piix_atv_pirq_rout(s, i);
+
+        if (!(rout & 0x80) && (rout & 0x0f) == pic_irq) {
+            level |= pci_bus_get_irq_level(bus, i);
+        }
+    }
+    qemu_set_irq(s->isa_irqs_in[pic_irq], level);
+}
+
+static void piix_atv_set_irq(void *opaque, int pirq, int level)
+{
+    PIIXState *s = opaque;
+    int pic_irq = piix_atv_pirq_rout(s, pirq) & 0x0f;
+
+    s->atv_pirq_level &= ~(1 << pirq);
+    s->atv_pirq_level |= !!level << pirq;
+
+    /* The IO-APIC wiring is fixed: PIRQ[A-H] -> GSI 16..23. */
+    qemu_set_irq(s->atv_pirq_apic[pirq], level);
+
+    if (!(piix_atv_pirq_rout(s, pirq) & 0x80) && pic_irq < ISA_NUM_IRQS) {
+        piix_atv_update_pic(s, pic_irq);
+    }
+}
+
+static PCIINTxRoute piix_atv_route_intx_pin_to_irq(void *opaque, int pirq)
+{
+    PIIXState *s = opaque;
+    uint8_t rout = piix_atv_pirq_rout(s, pirq);
+    PCIINTxRoute route;
+
+    route.mode = PCI_INTX_ENABLED;
+    if (!(rout & 0x80) && (rout & 0x0f) < ISA_NUM_IRQS) {
+        route.irq = rout & 0x0f;
+    } else {
+        route.irq = PIIX_ATV_PIRQ_APIC_BASE + pirq;
+    }
+    return route;
+}
+
+static void piix_atv_update_routing(PIIXState *s, uint32_t address, int len)
+{
+    int i, pic_irq;
+
+    if (!ranges_overlap(address, len, PIIX_ATV_PIRQCA, PIIX_ATV_NUM_PIRQS)) {
+        return;
+    }
+    pci_bus_fire_intx_routing_notifier(pci_get_bus(&s->dev));
+    for (i = 0; i < PIIX_ATV_NUM_PIRQS; i++) {
+        if (!ranges_overlap(address, len, PIIX_ATV_PIRQCA + i, 1)) {
+            continue;
+        }
+        qemu_set_irq(s->atv_pirq_apic[i],
+                     !!(s->atv_pirq_level & (1 << i)));
+    }
+    /* QEMU's level bookkeeping is per pirq; refresh every PIC line. */
+    for (pic_irq = 0; pic_irq < ISA_NUM_IRQS; pic_irq++) {
+        piix_atv_update_pic(s, pic_irq);
+    }
+}
+
+/*
+ * $PIR (PCI IRQ Routing Table v1.0) for the wiring above.  Linux's PIR scan
+ * (arch/x86/pci/irq.c) reads it straight out of the F-segment, treats the link
+ * byte as a config offset ("PIIX/ICH" router) and leaves the router alone when
+ * the register already names a usable IRQ.
+ */
+size_t piix_atv_build_pir_table(uint8_t *buf)
+{
+    const uint8_t irq_of[PIIX_ATV_NUM_PIRQS] = PIIX_ATV_PIRQ_DEFAULT;
+    uint32_t sum = 0;
+    size_t off, i;
+
+    memset(buf, 0, PIIX_ATV_PIR_TABLE_SIZE);
+    memcpy(buf, "$PIR", 4);
+    buf[4] = 0x00;                          /* version 1.00 */
+    buf[5] = 0x01;
+    buf[6] = PIIX_ATV_PIR_TABLE_SIZE & 0xff;
+    buf[7] = PIIX_ATV_PIR_TABLE_SIZE >> 8;
+    buf[8] = 0;                             /* router bus */
+    buf[9] = 0x1f << 3;                     /* router devfn: 00:1f.0 */
+    buf[12] = PCI_VENDOR_ID_INTEL & 0xff;
+    buf[13] = PCI_VENDOR_ID_INTEL >> 8;
+    buf[14] = PIIX3_PIRQ_ROUTER_DEVICE & 0xff;
+    buf[15] = PIIX3_PIRQ_ROUTER_DEVICE >> 8;
+
+    for (i = 0, off = 32; i < 31; i++, off += 16) {
+        int slot = i + 1;
+        uint8_t *e = buf + off;
+        int pin;
+
+        e[0] = 0;                           /* bus 0 */
+        e[1] = slot << 3;
+        for (pin = 0; pin < 4; pin++) {
+            int pirq = piix_atv_slot_pirq(slot, pin);
+            uint8_t *p = e + 2 + pin * 3;
+
+            if (pirq < 0) {
+                /* Not on the board's _PRT: same i440FX swizzle the machine
+                 * gives the bus, so the table never disagrees with the
+                 * routing pci_bus_map_irqs() installed. */
+                pirq = (pin + slot - 1) & 3;
+            }
+            p[0] = PIIX_ATV_PIRQCA + pirq;  /* link value = config offset */
+            p[1] = (1 << irq_of[pirq]) & 0xff;
+            p[2] = (1 << irq_of[pirq]) >> 8;
+        }
+        e[14] = slot <= 4 ? slot - 1 : 0;   /* slot number, 0 = onboard */
+    }
+
+    for (i = 0; i < PIIX_ATV_PIR_TABLE_SIZE; i++) {
+        sum += buf[i];
+    }
+    buf[PIIX_ATV_PIR_TABLE_SIZE - 1] = (uint8_t)(0x100 - (sum & 0xff));
+    return PIIX_ATV_PIR_TABLE_SIZE;
+}
+
+/*
+ * Republish the $PIR table into the F-segment, but only while the firmware is
+ * leaving that window alone: its DRAM pattern test paints 0xe0000-0xfffff and
+ * verifies what it wrote, so a write of ours inside its write/verify pair would
+ * fail its memory test outright.  One full poll period of silence therefore
+ * gates every write; before the test has run, and again once it is over, the
+ * window is stable and the table simply (re)appears.
+ */
+static void piix_atv_publish_pir(PIIXState *s)
+{
+    uint8_t now[PIIX_ATV_PIR_PROBE_SIZE + 16];
+    bool quiet;
+
+    address_space_read(&address_space_memory, PIIX_ATV_PIR_TABLE_ADDR,
+                       MEMTXATTRS_UNSPECIFIED, now, PIIX_ATV_PIR_PROBE_SIZE);
+    address_space_read(&address_space_memory, PIIX_ATV_PIR_PROBE_END,
+                       MEMTXATTRS_UNSPECIFIED,
+                       now + PIIX_ATV_PIR_PROBE_SIZE, 16);
+
+    quiet = !memcmp(now, s->atv_pir_seen, sizeof(now));
+    memcpy(s->atv_pir_seen, now, sizeof(now));
+    if (!quiet || !memcmp(now, s->atv_pir_table, PIIX_ATV_PIR_PROBE_SIZE)) {
+        return;
+    }
+    address_space_write(&address_space_memory, PIIX_ATV_PIR_TABLE_ADDR,
+                        MEMTXATTRS_UNSPECIFIED, s->atv_pir_table,
+                        sizeof(s->atv_pir_table));
+}
+
+static void piix_atv_pir_timer(void *opaque)
+{
+    PIIXState *s = opaque;
+
+    piix_atv_publish_pir(s);
+    timer_mod(s->atv_pir_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + PIIX_ATV_PIR_POLL_MS);
+}
+
+
 /* irq routing is changed. so rebuild bitmap */
 static void piix_update_pci_irq_levels(PIIXState *s)
 {
@@ -128,6 +341,10 @@ static void piix_write_config(PCIDevice *dev, uint32_t address, uint32_t val,
         if (ranges_overlap(address, len, 0xa2, 1)) {
             dev->config[0xa2] &= ~0x04;
         }
+    }
+    if (PIIX_PCI_DEVICE(dev)->atv_pirq) {
+        piix_atv_update_routing(PIIX_PCI_DEVICE(dev), address, len);
+        return;
     }
     if (ranges_overlap(address, len, PIIX_PIRQCA, 4)) {
         PIIXState *s = PIIX_PCI_DEVICE(dev);
@@ -157,6 +374,17 @@ static void piix_reset(DeviceState *dev)
     pci_conf[0x61] = 0x80;
     pci_conf[0x62] = 0x80;
     pci_conf[0x63] = 0x80;
+    if (d->atv_pirq) {
+        /* Real ICH7 reset value: PIRQ[A-D] disabled (APIC-only).  The ATV
+         * machine instead programs what a BIOS on a PIC-only box would, so
+         * that a guest without an IO-APIC still gets its PCI interrupts. */
+        const uint8_t def[PIIX_ATV_NUM_PIRQS] = PIIX_ATV_PIRQ_DEFAULT;
+        int i;
+
+        for (i = 0; i < PIIX_ATV_NUM_PIRQS; i++) {
+            pci_conf[PIIX_ATV_PIRQCA + i] = def[i];
+        }
+    }
     pci_conf[0x69] = 0x02;
     pci_conf[0x70] = 0x80;
     pci_conf[0x76] = 0x0c;
@@ -384,8 +612,21 @@ static void pci_piix_realize(PCIDevice *dev, const char *uhci_type,
         qdev_connect_gpio_out(DEVICE(&d->pm), 0, d->isa_irqs_in[9]);
     }
 
-    pci_bus_irqs(pci_bus, piix_set_pci_irq, d, PIIX_NUM_PIRQS);
-    pci_bus_set_route_irq_fn(pci_bus, piix_route_intx_pin_to_irq);
+    if (d->atv_pirq) {
+        /* ATV/ICH7: eight PIRQ lines, each feeding GSI 16+n as well as (when
+         * the route register says so) an ISA IRQ. */
+        pci_bus_irqs(pci_bus, piix_atv_set_irq, d, PIIX_ATV_NUM_PIRQS);
+        pci_bus_set_route_irq_fn(pci_bus, piix_atv_route_intx_pin_to_irq);
+
+        piix_atv_build_pir_table(d->atv_pir_table);
+        d->atv_pir_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                        piix_atv_pir_timer, d);
+        timer_mod(d->atv_pir_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + PIIX_ATV_PIR_POLL_MS);
+    } else {
+        pci_bus_irqs(pci_bus, piix_set_pci_irq, d, PIIX_NUM_PIRQS);
+        pci_bus_set_route_irq_fn(pci_bus, piix_route_intx_pin_to_irq);
+    }
 }
 
 static void build_pci_isa_aml(AcpiDevAmlIf *adev, Aml *scope)
@@ -415,6 +656,8 @@ static void pci_piix_init(Object *obj)
 
     qdev_init_gpio_out_named(DEVICE(obj), d->isa_irqs_in, "isa-irqs",
                              ISA_NUM_IRQS);
+    qdev_init_gpio_out_named(DEVICE(obj), d->atv_pirq_apic, "atv-pirq-apic",
+                             PIIX_ATV_NUM_PIRQS);
 
     object_initialize_child(obj, "rtc", &d->rtc, TYPE_MC146818_RTC);
 }
@@ -426,6 +669,7 @@ static const Property pci_piix_props[] = {
     DEFINE_PROP_BOOL("has-pit", PIIXState, has_pit, true),
     DEFINE_PROP_BOOL("has-usb", PIIXState, has_usb, true),
     DEFINE_PROP_BOOL("smm-enabled", PIIXState, smm_enabled, false),
+    DEFINE_PROP_BOOL("atv-pirq", PIIXState, atv_pirq, false),
 };
 
 static void pci_piix_class_init(ObjectClass *klass, const void *data)
