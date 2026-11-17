@@ -43,6 +43,12 @@
 #include "migration/vmstate.h"
 #include "hw/usb/usb.h"
 #include "net/net.h"
+#include "qemu/timer.h"
+#include "system/memory.h"
+#include "exec/memattrs.h"
+#include "ui/console.h"
+#include "ui/surface.h"
+#include "ui/vgafont.h"
 #include "hw/ide/pci.h"
 #include "hw/ide/ahci-pci.h"
 #include "hw/ide/ahci.h"
@@ -745,7 +751,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(ATVNvidiaGPUState, ATV_NVIDIA_GPU)
 #define ATV_NVIDIA_DEVICE_G72M 0x01d7   /* GeForce Go 7300 */
 #define ATV_NVIDIA_CHIPSET     0x0460   /* NV46 / G72M, PMC_BOOT_0[20:27] */
 #define ATV_NVIDIA_REGS_SIZE   0x01000000  /* 16 MiB  BAR0  */
-#define ATV_NVIDIA_FB_SIZE     0x10000000  /* 256 MiB BAR1  */
+#define ATV_NVIDIA_FB_SIZE     0x04000000  /* 64 MiB VRAM (BAR1 aperture) */
 #define ATV_NVIDIA_INST_SIZE   0x01000000  /* 16 MiB  BAR3  */
 #define ATV_NVIDIA_REG_SLOTS   8192
 #define ATV_NVIDIA_LOG_MAX     400000
@@ -764,6 +770,11 @@ struct ATVNvidiaGPUState {
     FILE *log;
     unsigned nlog;
     bool cfgdbg;
+    QemuConsole *con;
+    QEMUTimer *timer;
+    int disp_mode;
+    int geom_w, geom_h, geom_depth;
+    int text_cols, text_rows;
 };
 
 static void atv_nvidia_log(ATVNvidiaGPUState *s, char op, hwaddr addr,
@@ -854,6 +865,157 @@ static const MemoryRegionOps atv_nvidia_regs_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
+/*
+ * Display output.
+ *
+ * On the real machine the panel stays dark until the OS initialises the
+ * display: the firmware itself never produces a picture.  Under QEMU the disk's
+ * Linux loader draws a splash and hands the kernel a framebuffer, but the
+ * kernel's first console is the legacy text one (it writes 80x35 cells to
+ * 0xB8000), and once a linear framebuffer exists the pixels land in the BAR1
+ * aperture.  Both sources are rendered here, so the machine has a picture (and
+ * `screendump` works even with -display none).
+ *
+ *   ATV_GPU_DISPLAY=vram   render BAR1 as a linear framebuffer instead of text
+ *   ATV_GPU_GEOM=WxHxD     framebuffer geometry (default 1920x1080x32)
+ *   ATV_GPU_TEXT=CxR       text-console geometry (default 80x35)
+ */
+#define ATV_DISP_TEXT           0
+#define ATV_DISP_VRAM           1
+#define ATV_DISPLAY_REFRESH_MS  100
+#define ATV_DISPLAY_VGA_TEXT    0x000b8000
+
+static const uint32_t atv_nvidia_cga[16] = {
+    0x000000, 0x0000aa, 0x00aa00, 0x00aaaa,
+    0xaa0000, 0xaa00aa, 0xaa5500, 0xaaaaaa,
+    0x555555, 0x5555ff, 0x55ff55, 0x55ffff,
+    0xff5555, 0xff55ff, 0xffff55, 0xffffff,
+};
+
+static void atv_nvidia_draw_text(ATVNvidiaGPUState *s, DisplaySurface *surf)
+{
+    uint8_t cells[160 * 64 * 2];
+    int cols = MIN(s->text_cols, 160);
+    int rows = MIN(s->text_rows, 64);
+    int w = surface_width(surf), h = surface_height(surf);
+    int stride = surface_stride(surf) / 4;
+    uint32_t *dst = surface_data(surf);
+    int row, col;
+
+    address_space_read(&address_space_memory, ATV_DISPLAY_VGA_TEXT,
+                       MEMTXATTRS_UNSPECIFIED, cells, cols * rows * 2);
+    for (row = 0; row < rows; row++) {
+        int y0 = row * h / rows;
+        int y1 = MAX(y0 + 1, (row + 1) * h / rows);
+
+        for (col = 0; col < cols; col++) {
+            int x0 = col * w / cols;
+            int x1 = MAX(x0 + 1, (col + 1) * w / cols);
+            const uint8_t *cell = cells + (row * cols + col) * 2;
+            const uint8_t *glyph = vgafont16 + cell[0] * FONT_HEIGHT;
+            uint32_t fg = atv_nvidia_cga[cell[1] & 0x0f];
+            uint32_t bg = atv_nvidia_cga[(cell[1] >> 4) & 0x07];
+            int x, y;
+
+            for (y = y0; y < y1; y++) {
+                uint8_t bits = glyph[(y - y0) * FONT_HEIGHT / (y1 - y0)];
+                uint32_t *d = dst + (size_t)y * stride + x0;
+
+                for (x = x0; x < x1; x++) {
+                    int gx = (x - x0) * FONT_WIDTH / (x1 - x0);
+
+                    *d++ = (bits & (0x80 >> gx)) ? fg : bg;
+                }
+            }
+        }
+    }
+}
+
+static void atv_nvidia_draw_vram(ATVNvidiaGPUState *s, DisplaySurface *surf)
+{
+    const uint8_t *src;
+    uint8_t *dst = surface_data(surf);
+    int stride = surface_stride(surf);
+    int w = MIN(s->geom_w, surface_width(surf));
+    int h = MIN(s->geom_h, surface_height(surf));
+    int pitch = s->geom_w * 4;
+    int y;
+
+    if (s->geom_depth != 32) {
+        return;
+    }
+    src = memory_region_get_ram_ptr(&s->fb);
+    for (y = 0; y < h; y++) {
+        memcpy(dst + (size_t)y * stride, src + (size_t)y * pitch, w * 4);
+    }
+}
+
+static void atv_nvidia_render(ATVNvidiaGPUState *s)
+{
+    DisplaySurface *surf;
+
+    if (!s->con) {
+        return;
+    }
+    surf = qemu_console_surface(s->con);
+    if (!surf || surface_is_placeholder(surf)) {
+        return;
+    }
+    if (s->disp_mode == ATV_DISP_VRAM) {
+        atv_nvidia_draw_vram(s, surf);
+    } else {
+        atv_nvidia_draw_text(s, surf);
+    }
+}
+
+static void atv_nvidia_display_tick(void *opaque)
+{
+    ATVNvidiaGPUState *s = opaque;
+
+    atv_nvidia_render(s);
+    qemu_console_update_full(s->con);
+    timer_mod(s->timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
+                        ATV_DISPLAY_REFRESH_MS);
+}
+
+static bool atv_nvidia_gfx_update(void *opaque)
+{
+    atv_nvidia_render(opaque);
+    return true;
+}
+
+static const GraphicHwOps atv_nvidia_hw_ops = {
+    .gfx_update = atv_nvidia_gfx_update,
+};
+
+static void atv_nvidia_display_init(ATVNvidiaGPUState *s)
+{
+    const char *mode = getenv("ATV_GPU_DISPLAY");
+    const char *geom = getenv("ATV_GPU_GEOM");
+    const char *text = getenv("ATV_GPU_TEXT");
+    /* the ATV1's maximum output is 1080p60 */
+    int w = 1920, h = 1080, d = 32;
+
+    if (geom) {
+        sscanf(geom, "%dx%dx%d", &w, &h, &d);
+    }
+    s->text_cols = 80;
+    s->text_rows = 35;
+    if (text) {
+        sscanf(text, "%dx%d", &s->text_cols, &s->text_rows);
+    }
+    s->disp_mode = (mode && !strcmp(mode, "vram")) ? ATV_DISP_VRAM
+                                                   : ATV_DISP_TEXT;
+    s->geom_w = w;
+    s->geom_h = h;
+    s->geom_depth = d;
+
+    s->con = qemu_graphic_console_create(DEVICE(s), 0, &atv_nvidia_hw_ops, s);
+    qemu_console_resize(s->con, w, h);
+    s->timer = timer_new_ms(QEMU_CLOCK_REALTIME, atv_nvidia_display_tick, s);
+    timer_mod(s->timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 100);
+}
+
 static void atv_nvidia_gpu_realize(PCIDevice *pci_dev, Error **errp)
 {
     ATVNvidiaGPUState *s = ATV_NVIDIA_GPU(pci_dev);
@@ -900,6 +1062,8 @@ static void atv_nvidia_gpu_realize(PCIDevice *pci_dev, Error **errp)
     if (rom && *rom) {
         pci_dev->romfile = g_strdup(rom);
     }
+
+    atv_nvidia_display_init(s);
 
     if (getenv("ATV_GPU_DEBUG")) {
         error_report("atv-nvidia-gpu realize end: BAR0=%08x BAR1=%08x BAR3=%08x",

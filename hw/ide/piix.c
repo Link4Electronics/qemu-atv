@@ -148,6 +148,32 @@ static void piix_ide_reset(DeviceState *dev)
     }
 }
 
+/*
+ * Prog-if the ATV machine presents for its ICH7-M IDE function (8086:27df).
+ *
+ * 0x8f -- native mode, i.e. what the real controller reports.  The firmware's
+ *         Ide driver takes its native branch, reads the four channel BARs and
+ *         builds the command/control port table from them, which is why
+ *         piix_ide_reset() hardwires them to the legacy ATA addresses.
+ *
+ * 0x8a -- ISA-compat channels.  Linux's libata ignores the BARs and drives
+ *         0x1f0/0x3f6 (IRQ 14) and 0x170/0x376 (IRQ 15) as a plain PIIX3,
+ *         which is what this device actually is behind the ID.  This matters
+ *         because the ATV machine has no PCI interrupt routing: in native mode
+ *         ata_pci_sff_init_host() finds neither usable BARs (they are
+ *         hardwired, so pci_resource_len() is 0) nor an IRQ, prints
+ *         "no available native port" and the guest OS never sees a disk.
+ *
+ * ATV_IDE_PROGIF overrides the value so both modes can be compared without a
+ * rebuild (see AGENTS.md, boot-from-disk bring-up).
+ */
+static uint8_t piix_ide_atv_progif(void)
+{
+    const char *s = getenv("ATV_IDE_PROGIF");
+
+    return s ? (uint8_t)strtoul(s, NULL, 0) : 0x8f;
+}
+
 static bool pci_piix_init_bus(PCIIDEState *d, unsigned i, Error **errp)
 {
     static const struct {
@@ -191,7 +217,7 @@ static void pci_piix_ide_realize(PCIDevice *dev, Error **errp)
         pci_conf[PCI_VENDOR_ID + 1] = (PCI_VENDOR_ID_INTEL >> 8) & 0xff;
         pci_conf[PCI_DEVICE_ID] = 0xdf;
         pci_conf[PCI_DEVICE_ID + 1] = 0x27;
-        pci_conf[PCI_CLASS_PROG] = 0x8f; /* native mode, ISA-compat channels */
+        pci_conf[PCI_CLASS_PROG] = piix_ide_atv_progif();
     } else {
         pci_conf[PCI_CLASS_PROG] = 0x80; // legacy ATA mode
     }
