@@ -36,6 +36,7 @@
 #include "hw/timer/hpet.h"
 #include "hw/core/loader.h"
 #include "hw/rtc/mc146818rtc.h"
+#include "hw/i386/apic_internal.h"
 #include "hw/intc/i8259.h"
 #include "hw/timer/i8254.h"
 #include "hw/input/i8042.h"
@@ -535,11 +536,59 @@ typedef struct ATVStubState {
     uint32_t sts[5];
     bool active[5];
     MemoryRegion mchbar;
+    MemoryRegion pmt;
     uint8_t spd_addr;
     uint32_t mch[0x1000 / 4];
 } ATVStubState;
 
 static ATVStubState atv_stub;
+
+/*
+ * The MCP's ACPI PM block sits at I/O 0x400 and the firmware uses its 24-bit
+ * PM timer (0x408) as the only time base: TimerArch -> GetTimerValue reads one
+ * dword here and converts it to 100 ns units, with 24-bit wrap handling.  An
+ * unmapped port reads all-ones, so the elapsed time was always 0 and
+ * CoreTimerTick never advanced - every EFI timer, timeout and Stall was dead.
+ */
+#define ATV_PM_TIMER_FREQ 3579545ULL
+
+static uint64_t atv_pmt_read(void *opaque, hwaddr addr, unsigned size)
+{
+    uint64_t freq = ATV_PM_TIMER_FREQ;
+    uint32_t val = 0;
+    const char *env;
+
+    env = getenv("ATV_PMT_FREQ");
+    if (env != NULL) {
+        freq = strtoull(env, NULL, 0);
+    }
+
+    switch (addr & ~3) {
+    case 0x08:
+        val = (uint32_t)((qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) * freq) /
+                         1000000000ULL) & 0xffffff;
+        break;
+    default:
+        break;
+    }
+    val >>= (addr & 3) * 8;
+    return val & ((1ULL << (size * 8)) - 1);
+}
+
+static void atv_pmt_write(void *opaque, hwaddr addr, uint64_t val,
+                          unsigned size)
+{
+}
+
+static const MemoryRegionOps atv_pmt_ops = {
+    .read = atv_pmt_read,
+    .write = atv_pmt_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
 
 static uint64_t atv_io_read_proxy(void *opaque, hwaddr addr, unsigned size)
 {
@@ -781,6 +830,21 @@ void pc_machine_done(Notifier *notifier, void *data)
             }
         }
         (void)sz;
+    }
+
+    if (pcms->car_size > 0) {
+        /*
+         * The ATV firmware drives the 8259 directly and never programs the
+         * local APIC (no IA32_APIC_BASE/LINT0 access anywhere in the flash).
+         * QEMU resets every LVT masked, and pic_irq_request() routes the PIC
+         * through the APIC whenever IA32_APIC_BASE.EN is set (it is set at
+         * reset), so apic_accept_pic_intr() sees LINT0 masked and silently
+         * drops every PIC interrupt - no timer tick, ever.  Model the real
+         * board, where the south bridge's 8259 INT output is wired to LINT0,
+         * by bringing LINT0 up in ExtINT (virtual-wire) mode (see
+         * apic_init_reset()).
+         */
+        apic_lint0_extint_default = true;
     }
 
     {
@@ -1124,6 +1188,10 @@ void pc_memory_init(PCMachineState *pcms,
                               &atv_stub, "atv-mchbar", 0x1000);
         memory_region_add_subregion(system_memory, 0xfed14000,
                                     &atv_stub.mchbar);
+
+        memory_region_init_io(&atv_stub.pmt, OBJECT(pcms), &atv_pmt_ops,
+                              NULL, "atv-pmtimer", 0x40);
+        memory_region_add_subregion(get_system_io(), 0x400, &atv_stub.pmt);
         static const struct { hwaddr base; uint64_t size; const char *name; }
         mmio_windows[] = {
             { 0xfed15000, 0x1000, "atv-dmibar" },

@@ -248,8 +248,9 @@ static void pc_init1(MachineState *machine, const char *pci_type)
     gsi_state = pc_gsi_create(&x86ms->gsi, true);
 
     pci_dev = pci_new_multifunction(PCI_DEVFN(0x1f, 0), pcms->south_bridge);
-    /* ATV: leave 00:1f.2 free for the ICH7 SATA/AHCI function (the firmware
-     * has an AHCI-only storage driver) instead of PIIX3's UHCI */
+    /* ATV: the real ATV1 has no function at 00:1f.2 (its USB is the ICH7 UHCI
+     * at 00:1d.0, created below), so keep the PIIX3 UHCI disabled; the IDE
+     * child at 00:1f.1 is what carries the PATA disk. */
     object_property_set_bool(OBJECT(pci_dev), "has-usb",
                              pcms->car_size > 0 ? false : machine_usb(machine),
                              &error_abort);
@@ -305,29 +306,28 @@ static void pc_init1(MachineState *machine, const char *pci_type)
     }
 
     if (pcms->car_size > 0) {
-        DeviceState *ahci_sata;
+        PCIDevice *uhci;
+        DeviceState *uhci_dev;
 
         pci_create_simple(pcms->pcibus, -1, TYPE_ATV_NVIDIA_GPU);
 
-        /* The ATV1 (Intel 945GM + ICH7-M southbridge) firmware has a native
-         * AHCI/SATA storage driver (SataAhci, matches PCI class 0x0106) and
-         * boots its disk with the ICH7-M SATA controller in AHCI mode.  The
-         * stock PIIX3 IDE child (class 0x01018f) is never matched or probed.
-         * Create an ICH7-M AHCI HBA (8086:27c1) at 00:1f.2 (the ICH7 SATA
-         * slot) so the firmware's SataAhci driver binds it and probes the
-         * SATA disk, letting Partition/HFS install SimpleFileSystem for BDS.
-         * The disk is attached with -device ide-hd,bus=<ahci-port>,drive=xx. */
-        ahci_sata = DEVICE(pci_create_simple_multifunction(pcms->pcibus,
-                         PCI_DEVFN(0x1f, 2), TYPE_ICH7M_AHCI));
-        pcms->idebus[0] = qdev_get_child_bus(ahci_sata, "ide.0");
-        pcms->idebus[1] = qdev_get_child_bus(ahci_sata, "ide.1");
-
-        /* The ATV1's built-in IR receiver (USB 05ac:8241) must be present
-         * for the firmware's "armt" (A7A1EC06) driver to install protocol
-         * 9C5DD135, which DuetBds phase-2 busy-waits on.  The PIIX3 UHCI is
-         * disabled in ATV mode (to keep 00:1f.2 for the AHCI), so add an
-         * Apple OHCI controller and hang the IR receiver HID off its bus. */
-        pci_create_simple(pcms->pcibus, -1, "pci-ohci");
+        /*
+         * Real ATV1 (lspci, atv-devicetree/pci/vv-xxx-all.txt):
+         *   00:1d.0  8086:27c8  ICH7 UHCI (IR receiver 05ac:8241 hangs here)
+         *   00:1f.1  8086:27df  ICH7 IDE, prog-if 8f  <- the PATA disk
+         * There is no SATA/AHCI function and the firmware's USB stack is
+         * UHCI-only (FvFile 2fb92efa "Usb Uhci Driver"), so the controller
+         * must be a UHCI at 00:1d.0.  pcms->idebus[] keeps pointing at the
+         * ICH7 IDE child so -drive if=ide / -device ide-hd,bus=ide.0 land on
+         * the controller the firmware's "PCI ATA/ATAPI Bus Driver"
+         * (FvFile 69fd8e47) actually binds.
+         */
+        uhci_dev = DEVICE(pci_create_simple_multifunction(pcms->pcibus,
+                                PCI_DEVFN(0x1d, 0), TYPE_ICH9_USB_UHCI(1)));
+        uhci = PCI_DEVICE(uhci_dev);
+        pci_config_set_vendor_id(uhci->config, PCI_VENDOR_ID_INTEL);
+        pci_config_set_device_id(uhci->config, 0x27c8);
+        pci_config_set_revision(uhci->config, 0x02);
         {
             USBBus *atv_usb;
             atv_usb = USB_BUS(object_resolve_type_unambiguous(

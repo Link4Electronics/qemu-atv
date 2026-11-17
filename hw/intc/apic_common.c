@@ -178,6 +178,8 @@ uint32_t apic_get_current_count(APICCommonState *s)
     return val;
 }
 
+bool apic_lint0_extint_default;
+
 void apic_init_reset(APICCommonState *s)
 {
     APICCommonClass *info;
@@ -195,6 +197,9 @@ void apic_init_reset(APICCommonState *s)
     memset(s->irr, 0, sizeof(s->irr));
     for (i = 0; i < APIC_LVT_NB; i++) {
         s->lvt[i] = APIC_LVT_MASKED;
+    }
+    if (apic_lint0_extint_default) {
+        s->lvt[APIC_LVT_LINT0] = APIC_DM_EXTINT << 8;
     }
     s->esr = 0;
     memset(s->icr, 0, sizeof(s->icr));

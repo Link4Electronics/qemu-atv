@@ -37,6 +37,7 @@
 #include "qapi/visitor.h"
 #include "qemu/error-report.h"
 #include "qom/object.h"
+#include "hw/core/cpu.h"
 
 /*
  * I440FX chipset data sheet.
@@ -287,8 +288,11 @@ static uint32_t i440fx_read_config(PCIDevice *dev, uint32_t address, int len)
     /* ATV debug: log MCH (dev0) config reads the SEC relies on. */
     if (object_property_get_uint(qdev_get_machine(), "car-size", NULL) > 0) {
         if (address <= 0x1ff) {
-            fprintf(stderr, "ATV MCH cfg read off=0x%02x len=%d -> 0x%08x\n",
-                    address, len, v);
+            CPUState *cs = qemu_get_cpu(0);
+
+            fprintf(stderr, "ATV MCH cfg read off=0x%02x len=%d -> 0x%08x eip=%08x\n",
+                    address, len, v,
+                    cs ? (uint32_t)cs->cc->get_pc(cs) : 0);
         }
     }
     return v;

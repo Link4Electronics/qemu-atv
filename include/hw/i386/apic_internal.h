@@ -37,6 +37,12 @@
 #define APIC_LVT_ERROR                  5
 #define APIC_LVT_NB                     6
 
+/*
+ * Boards that wire the south bridge's 8259 INT output to LINT0 (instead of
+ * expecting firmware to program the APIC) bring LINT0 up in ExtINT mode.
+ */
+extern bool apic_lint0_extint_default;
+
 /* APIC delivery modes */
 #define APIC_DM_FIXED                   0
 #define APIC_DM_LOWPRI                  1
