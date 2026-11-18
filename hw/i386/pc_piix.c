@@ -59,8 +59,18 @@
 #include "hw/core/sysbus.h"
 #include "hw/i2c/smbus_eeprom.h"
 #include "system/memory.h"
+#include "system/reset.h"
 
 #define TYPE_ATV_NVIDIA_GPU "atv-nvidia-gpu"
+
+/*
+ * I/O window the ATV machine leaves programmed in the UHCI's BAR4.  Nothing
+ * under this machine ever runs PCI resource allocation, so without a
+ * pre-programmed BAR the controller has no I/O space at all (see the ATV USB
+ * block in pc_piix_init_bridge()).
+ */
+#define ATV_UHCI_IO_BASE 0xcc00
+
 #include "hw/acpi/acpi.h"
 #include "hw/vfio/types.h"
 #include "qapi/error.h"
@@ -102,6 +112,35 @@ static int pc_pci_slot_get_pirq(PCIDevice *pci_dev, int pci_intx)
     slot_addend = PCI_SLOT(pci_dev->devfn) - 1;
     return (pci_intx + slot_addend) & 3;
 }
+
+/*
+ * Re-apply the UHCI's BAR after every reset.  pci_do_device_reset() clears the
+ * command register and pci_reset_regions() wipes the BAR address back to its
+ * type bits, so a BAR programmed once at machine init does not survive the
+ * reset that runs before the guest starts.  The handler therefore has to be
+ * registered after the device tree itself, which only happens in
+ * qemu_machine_creation_done() -- hence the init-done notifier.
+ */
+static PCIDevice *atv_uhci;
+
+static void atv_uhci_bar_reset(void *opaque)
+{
+    PCIDevice *uhci = opaque;
+
+    pci_set_long(uhci->config + PCI_BASE_ADDRESS_4,
+                 ATV_UHCI_IO_BASE | PCI_BASE_ADDRESS_SPACE_IO);
+    pci_default_write_config(uhci, PCI_COMMAND,
+                             PCI_COMMAND_IO | PCI_COMMAND_MASTER, 2);
+}
+
+static void atv_uhci_bar_notify(Notifier *notifier, void *data)
+{
+    qemu_register_reset(atv_uhci_bar_reset, atv_uhci);
+}
+
+static Notifier atv_uhci_bar_notifier = {
+    .notify = atv_uhci_bar_notify,
+};
 
 /*
  * ATV1 slot -> PIRQ wiring, straight from the firmware's DSDT _PRT (see
@@ -370,6 +409,19 @@ static void pc_init1(MachineState *machine, const char *pci_type)
         pci_config_set_vendor_id(uhci->config, PCI_VENDOR_ID_INTEL);
         pci_config_set_device_id(uhci->config, 0x27c8);
         pci_config_set_revision(uhci->config, 0x02);
+        /*
+         * The firmware's PciBus enumerates the bus but never allocates
+         * resources (the platform resource list it would allocate from is
+         * empty), so every BAR stays 0 -- and the success of the storage
+         * stack depends on the IDE function having hardwired BARs.  The UHCI
+         * has none: its I/O BAR reads 0, the register window is unmapped and
+         * the firmware's UsbUhci driver, while it does install EFI_USB_HC,
+         * talks to nothing, so no USB device is ever enumerated and there is
+         * no BlockIo/SimpleFileSystem to boot from.  Leave the BAR programmed
+         * the way a BIOS would, so the controller is reachable.
+         */
+        atv_uhci = uhci;
+        qemu_add_machine_init_done_notifier(&atv_uhci_bar_notifier);
         {
             USBBus *atv_usb;
             atv_usb = USB_BUS(object_resolve_type_unambiguous(
@@ -789,6 +841,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(ATVNvidiaGPUState, ATV_NVIDIA_GPU)
 #define ATV_NVIDIA_REGS_SIZE   0x01000000  /* 16 MiB  BAR0  */
 #define ATV_NVIDIA_FB_SIZE     0x04000000  /* 64 MiB VRAM (BAR1 aperture) */
 #define ATV_NVIDIA_INST_SIZE   0x01000000  /* 16 MiB  BAR3  */
+#define ATV_NVIDIA_REG_BASE    0x21000000
+#define ATV_NVIDIA_FB_BASE     0x10000000
+#define ATV_NVIDIA_INST_BASE   0x20000000
 #define ATV_NVIDIA_REG_SLOTS   8192
 #define ATV_NVIDIA_LOG_MAX     400000
 
@@ -811,6 +866,19 @@ struct ATVNvidiaGPUState {
     int disp_mode;
     int geom_w, geom_h, geom_depth;
     int text_cols, text_rows;
+    /*
+     * Idle frames are skipped.  Re-copying the aperture and re-uploading an
+     * 8 MiB texture ten times a second costs more host CPU than the guest
+     * itself, and the console sits idle most of the time (dialog menus, a
+     * stalled kernel, the firmware's own text screen).  The text source is
+     * compared against a signature of the cells it renders; the VRAM source
+     * uses the dirty bitmap QEMU already maintains for DIRTY_MEMORY_VGA.
+     */    uint64_t last_text_sig;
+    uint64_t guest_sig;
+    bool have_last;
+    bool vram_seen;
+    bool dispdbg;
+    int last_src;
 };
 
 static void atv_nvidia_log(ATVNvidiaGPUState *s, char op, hwaddr addr,
@@ -912,12 +980,24 @@ static const MemoryRegionOps atv_nvidia_regs_ops = {
  * aperture.  Both sources are rendered here, so the machine has a picture (and
  * `screendump` works even with -display none).
  *
+ *   ATV_GPU_DISPLAY=text   render the 0xB8000 text console (default)
  *   ATV_GPU_DISPLAY=vram   render BAR1 as a linear framebuffer instead of text
+ *   ATV_GPU_DISPLAY=auto   text until the guest has drawn into BAR1, then VRAM;
+ *                          this is what a watcher wants, because the firmware
+ *                          and the loader only use the text console while the
+ *                          kernel switches to the linear framebuffer
  *   ATV_GPU_GEOM=WxHxD     framebuffer geometry (default 1920x1080x32)
  *   ATV_GPU_TEXT=CxR       text-console geometry (default 80x35)
+ *
+ * ATV_GPU_GEOM is only the fallback geometry: a guest that fills in the mode
+ * header the software UGA driver writes (atv/ugablob.c) chooses the resolution
+ * itself, and this device resizes its console to match.  That is what makes
+ * the firmware's own graphics callers - the field diagnostics GUI, or the
+ * boot.efi splash - visible without a GPU register model.
  */
 #define ATV_DISP_TEXT           0
 #define ATV_DISP_VRAM           1
+#define ATV_DISP_AUTO           2
 #define ATV_DISPLAY_REFRESH_MS  100
 #define ATV_DISPLAY_VGA_TEXT    0x000b8000
 
@@ -967,49 +1047,257 @@ static void atv_nvidia_draw_text(ATVNvidiaGPUState *s, DisplaySurface *surf)
     }
 }
 
-static void atv_nvidia_draw_vram(ATVNvidiaGPUState *s, DisplaySurface *surf)
+static void atv_nvidia_draw_vram(DisplaySurface *surf, const uint8_t *src,
+                                 int w, int h, int pitch)
 {
-    const uint8_t *src;
     uint8_t *dst = surface_data(surf);
     int stride = surface_stride(surf);
-    int w = MIN(s->geom_w, surface_width(surf));
-    int h = MIN(s->geom_h, surface_height(surf));
-    int pitch = s->geom_w * 4;
+    int cols = MIN(w, surface_width(surf));
+    int rows = MIN(h, surface_height(surf));
     int y;
 
-    if (s->geom_depth != 32) {
-        return;
+    for (y = 0; y < rows; y++) {
+        memcpy(dst + (size_t)y * stride, src + (size_t)y * pitch,
+               (size_t)cols * 4);
     }
-    src = memory_region_get_ram_ptr(&s->fb);
-    for (y = 0; y < h; y++) {
-        memcpy(dst + (size_t)y * stride, src + (size_t)y * pitch, w * 4);
+}
+
+/*
+ * Guest-chosen scanout geometry.
+ *
+ * The last 8 KiB of the aperture holds a small header that the software UGA
+ * driver (atv/ugablob.c, installed by atv/ugafake.py) rewrites on every
+ * SetMode: {magic 'UGA1', width, height, depth, refresh, fb base, pitch,
+ * event count}.  A guest that never fills it in - the Linux kernel driven by
+ * the stamped screen_info, for instance - keeps the ATV_GPU_GEOM default, so
+ * nothing changes for the existing boots.
+ */
+#define ATV_NVIDIA_HDR_OFF    0x03FFE000
+#define ATV_NVIDIA_HDR_MAGIC  0x31414755u       /* 'UGA1' */
+
+typedef struct ATVNvidiaModeHdr {
+    uint32_t magic;
+    uint32_t width;
+    uint32_t height;
+    uint32_t depth;
+    uint32_t refresh;
+    uint32_t base;
+    uint32_t pitch;
+    uint32_t events;
+} ATVNvidiaModeHdr;
+
+static bool atv_nvidia_guest_mode(ATVNvidiaGPUState *s, int *w, int *h,
+                                  int *pitch, const uint8_t **src,
+                                  uint64_t *sig)
+{
+    const uint8_t *ram = memory_region_get_ram_ptr(&s->fb);
+    const ATVNvidiaModeHdr *m = (const ATVNvidiaModeHdr *)
+                                (ram + ATV_NVIDIA_HDR_OFF);
+    uint32_t base, line, ww, hh;
+
+    if (m->magic != ATV_NVIDIA_HDR_MAGIC) {
+        return false;
     }
+    ww = m->width;
+    hh = m->height;
+    base = m->base;
+    line = m->pitch ? m->pitch : ww * 4;
+    if (ww < 16 || ww > 4096 || hh < 16 || hh > 4096) {
+        return false;
+    }
+    if (line < ww * 4 || line > 0x10000) {
+        return false;
+    }
+    if (base < ATV_NVIDIA_FB_BASE ||
+        (uint64_t)base - ATV_NVIDIA_FB_BASE + (uint64_t)line * hh >
+        ATV_NVIDIA_FB_SIZE) {
+        return false;
+    }
+    *w = ww;
+    *h = hh;
+    *pitch = line;
+    *src = ram + (base - ATV_NVIDIA_FB_BASE);
+    *sig = ((uint64_t)ww << 32) | ((uint64_t)hh << 16) | (line >> 4);
+    return true;
+}
+
+static bool atv_nvidia_vram_written(ATVNvidiaGPUState *s)
+{
+    const uint8_t *p;
+    const ATVNvidiaModeHdr *m;
+
+    if (s->vram_seen) {
+        return true;
+    }
+    /*
+     * A guest that filled in the software UGA driver's mode header is drawing
+     * through a graphics protocol, so scan the aperture out even while every
+     * pixel it has painted so far is black - deciding "nothing is happening"
+     * from the pixel content alone leaves the window on the (empty) text
+     * console exactly when a graphical UI owns the screen.  fbpatch.py clears
+     * the header when the kernel takes the framebuffer over, so this does not
+     * affect the Linux path.
+     */
+    p = memory_region_get_ram_ptr(&s->fb);
+    m = (const ATVNvidiaModeHdr *)(p + ATV_NVIDIA_HDR_OFF);
+    if (m->magic == ATV_NVIDIA_HDR_MAGIC && m->events) {
+        s->vram_seen = true;
+        return true;
+    }
+    /*
+     * Sample the whole aperture, not just its head: once a graphical program
+     * owns the screen it usually clears it and draws in the middle, so the
+     * first pages stay zero while the picture is definitely there.  The
+     * decision is sticky - flipping back to the (empty) text console would
+     * blank the window as soon as the console clears itself.
+     */
+    for (size_t i = 0; i < ATV_NVIDIA_FB_SIZE; i += 4096) {
+        if (p[i]) {
+            s->vram_seen = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+static uint64_t atv_nvidia_text_sig(ATVNvidiaGPUState *s)
+{
+    uint8_t cells[160 * 64 * 2];
+    int cols = MIN(s->text_cols, 160);
+    int rows = MIN(s->text_rows, 64);
+    int n = cols * rows * 2;
+    uint64_t h = 1469598103934665603ULL;
+    int i;
+
+    address_space_read(&address_space_memory, ATV_DISPLAY_VGA_TEXT,
+                       MEMTXATTRS_UNSPECIFIED, cells, n);
+    for (i = 0; i < n; i++) {
+        h = (h ^ cells[i]) * 1099511628211ULL;
+    }
+    return h;
 }
 
 static void atv_nvidia_render(ATVNvidiaGPUState *s)
 {
     DisplaySurface *surf;
+    bool vram;
 
     if (!s->con) {
         return;
     }
-    surf = qemu_console_surface(s->con);
-    if (!surf || surface_is_placeholder(surf)) {
+    vram = s->disp_mode == ATV_DISP_VRAM ||
+           (s->disp_mode == ATV_DISP_AUTO && atv_nvidia_vram_written(s));
+    if (s->dispdbg && (int)vram != s->last_src) {
+        const uint8_t *p = memory_region_get_ram_ptr(&s->fb);
+        const ATVNvidiaModeHdr *m = (const ATVNvidiaModeHdr *)
+                                    (p + ATV_NVIDIA_HDR_OFF);
+        size_t i, firstnz = (size_t)-1;
+
+        for (i = 0; i < ATV_NVIDIA_FB_SIZE; i += 4096) {
+            if (p[i]) {
+                firstnz = i;
+                break;
+            }
+        }
+        s->last_src = vram;
+        error_report("atv-gpu: source=%s uga=%08x %ux%u events=%u "
+                     "fills=%u first-nonzero=%s%zx",
+                     vram ? "vram" : "text", m->magic, m->width, m->height,
+                     m->events,
+                     *(const uint32_t *)(p + 0x744),
+                     firstnz == (size_t)-1 ? "" : "0x",
+                     firstnz == (size_t)-1 ? 0 : firstnz);
+    }
+    if (!vram) {
+        surf = qemu_console_surface(s->con);
+        if (!surf || surface_is_placeholder(surf)) {
+            return;
+        }
+        atv_nvidia_draw_text(s, surf);
         return;
     }
-    if (s->disp_mode == ATV_DISP_VRAM) {
-        atv_nvidia_draw_vram(s, surf);
-    } else {
-        atv_nvidia_draw_text(s, surf);
+
+    {
+        const uint8_t *src;
+        int w, h, pitch;
+        uint64_t sig;
+
+        if (s->geom_depth != 32) {
+            return;
+        }
+        if (!atv_nvidia_guest_mode(s, &w, &h, &pitch, &src, &sig)) {
+            w = s->geom_w;
+            h = s->geom_h;
+            pitch = s->geom_w * 4;
+            src = memory_region_get_ram_ptr(&s->fb);
+        }
+        if (qemu_console_get_width(s->con, -1) != w ||
+            qemu_console_get_height(s->con, -1) != h) {
+            qemu_console_resize(s->con, w, h);
+        }
+        surf = qemu_console_surface(s->con);
+        if (!surf || surface_is_placeholder(surf)) {
+            return;
+        }
+        atv_nvidia_draw_vram(surf, src, w, h, pitch);
     }
+}
+
+static bool atv_nvidia_changed(ATVNvidiaGPUState *s, bool vram)
+{
+    if (vram) {
+        DirtyBitmapSnapshot *snap;
+        bool dirty;
+        const uint8_t *src;
+        int w, h, pitch;
+        uint64_t sig;
+
+        if (atv_nvidia_guest_mode(s, &w, &h, &pitch, &src, &sig) &&
+            sig != s->guest_sig) {
+            s->guest_sig = sig;
+            return true;
+        }
+        snap = memory_region_snapshot_and_clear_dirty(&s->fb, 0,
+                                                      ATV_NVIDIA_FB_SIZE,
+                                                      DIRTY_MEMORY_VGA);
+        if (!snap) {
+            return true;
+        }
+        dirty = memory_region_snapshot_get_dirty(&s->fb, snap, 0,
+                                                 ATV_NVIDIA_FB_SIZE);
+        g_free(snap);
+        return dirty;
+    } else {
+        uint64_t sig = atv_nvidia_text_sig(s);
+        bool changed = !s->have_last || sig != s->last_text_sig;
+
+        s->last_text_sig = sig;
+        s->have_last = true;
+        return changed;
+    }
+}
+
+static void atv_nvidia_render_if_changed(ATVNvidiaGPUState *s)
+{
+    bool vram;
+
+    if (!s->con) {
+        return;
+    }
+    vram = s->disp_mode == ATV_DISP_VRAM ||
+           (s->disp_mode == ATV_DISP_AUTO && atv_nvidia_vram_written(s));
+    if (!atv_nvidia_changed(s, vram)) {
+        return;
+    }
+    atv_nvidia_render(s);
+    qemu_console_update_full(s->con);
 }
 
 static void atv_nvidia_display_tick(void *opaque)
 {
     ATVNvidiaGPUState *s = opaque;
 
-    atv_nvidia_render(s);
-    qemu_console_update_full(s->con);
+    atv_nvidia_render_if_changed(s);
     timer_mod(s->timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
                         ATV_DISPLAY_REFRESH_MS);
 }
@@ -1041,15 +1329,75 @@ static void atv_nvidia_display_init(ATVNvidiaGPUState *s)
         sscanf(text, "%dx%d", &s->text_cols, &s->text_rows);
     }
     s->disp_mode = (mode && !strcmp(mode, "vram")) ? ATV_DISP_VRAM
+                 : (mode && !strcmp(mode, "auto")) ? ATV_DISP_AUTO
                                                    : ATV_DISP_TEXT;
     s->geom_w = w;
     s->geom_h = h;
     s->geom_depth = d;
+    s->dispdbg = getenv("ATV_GPU_DEBUG") != NULL;
+    s->last_src = -1;
 
     s->con = qemu_graphic_console_create(DEVICE(s), 0, &atv_nvidia_hw_ops, s);
     qemu_console_resize(s->con, w, h);
     s->timer = timer_new_ms(QEMU_CLOCK_REALTIME, atv_nvidia_display_tick, s);
     timer_mod(s->timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 100);
+}
+
+/*
+ * The real ATV1 GPU is a PCIe endpoint (01:00.0) behind the 945GM root port at
+ * 00:01.0, with a Power Management capability at 0x60 and an Express
+ * capability at 0x78 (atv-devicetree pci/vv-xxx-all.txt).  The shim lives on
+ * the i440FX conventional bus because there is no root complex here, but the
+ * config space a driver reads still has to look like the real card: Apple's
+ * subsystem ID 106b:0081 and a trained 2.5 GT/s x16 link.
+ *
+ * The capability bytes are written directly instead of through
+ * pcie_endpoint_cap_init(), which asserts pci_is_express() and would need a
+ * PCIe bus that this machine does not have.
+ */
+#define ATV_GPU_PM_CAP_OFF   0x60
+#define ATV_GPU_EXP_CAP_OFF  0x78
+#define ATV_GPU_DEVCAP       0x012c0480
+#define ATV_GPU_DEVCTL       0x2810
+#define ATV_GPU_LNKCAP       (1 | (16 << 4) | (1 << 10))  /* 2.5 GT/s, x16 */
+#define ATV_GPU_LNKCTL       0x0048
+#define ATV_GPU_LNKSTA       (1 | (16 << 4) | (1 << 12))  /* trained, DLL up */
+
+static void atv_nvidia_pcie_caps(PCIDevice *dev)
+{
+    uint8_t *c = dev->config;
+    Error *local_err = NULL;
+    int pm, exp;
+
+    pm = pci_add_capability(dev, PCI_CAP_ID_PM, ATV_GPU_PM_CAP_OFF,
+                            PCI_PM_SIZEOF, &local_err);
+    if (pm < 0) {
+        error_report_err(local_err);
+        return;
+    }
+    pci_set_word(c + pm + PCI_PM_PMC, 0x0002);      /* PM spec 1.1, no wake */
+    pci_set_word(c + pm + PCI_PM_CTRL, 0x0000);     /* D0 */
+
+    exp = pci_add_capability(dev, PCI_CAP_ID_EXP, ATV_GPU_EXP_CAP_OFF,
+                             PCI_EXP_VER1_SIZEOF, &local_err);
+    if (exp < 0) {
+        error_report_err(local_err);
+        return;
+    }
+    pci_set_word(c + exp + PCI_EXP_FLAGS,
+                 PCI_EXP_FLAGS_VERS |
+                 (PCI_EXP_TYPE_ENDPOINT << PCI_EXP_FLAGS_TYPE_SHIFT));
+    pci_set_long(c + exp + PCI_EXP_DEVCAP, ATV_GPU_DEVCAP);
+    pci_set_word(c + exp + PCI_EXP_DEVCTL, ATV_GPU_DEVCTL);
+    pci_set_word(c + exp + PCI_EXP_DEVSTA, 0);
+    pci_set_long(c + exp + PCI_EXP_LNKCAP, ATV_GPU_LNKCAP);
+    pci_set_word(c + exp + PCI_EXP_LNKCTL, ATV_GPU_LNKCTL);
+    pci_set_word(c + exp + PCI_EXP_LNKSTA, ATV_GPU_LNKSTA);
+    pci_set_word(c + exp + PCI_EXP_SLTCAP, 0);
+    pci_set_word(c + exp + PCI_EXP_SLTCTL, 0);
+    pci_set_word(c + exp + PCI_EXP_SLTSTA, 0);
+    pci_set_long(c + exp + PCI_EXP_DEVCAP2, 0);
+    pci_set_word(c + exp + PCI_EXP_DEVCTL2, 0);
 }
 
 static void atv_nvidia_gpu_realize(PCIDevice *pci_dev, Error **errp)
@@ -1058,10 +1406,15 @@ static void atv_nvidia_gpu_realize(PCIDevice *pci_dev, Error **errp)
     uint8_t *c = pci_dev->config;
     const char *logpath = getenv("ATV_GPU_LOG");
     const char *rom = getenv("ATV_GPU_ROM");
+    const char *pcie = getenv("ATV_GPU_PCIE");
     unsigned i;
 
     c[PCI_INTERRUPT_PIN] = 0x01;
-    c[PCI_LATENCY_TIMER] = 0x40;
+    c[PCI_CACHE_LINE_SIZE] = 0x40;
+    c[PCI_LATENCY_TIMER] = 0x00;
+    if (!pcie || strcmp(pcie, "0")) {
+        atv_nvidia_pcie_caps(pci_dev);
+    }
 
     for (i = 0; i < ATV_NVIDIA_REG_SLOTS; i++) {
         s->reg[i].addr = 0xFFFFFFFF;
@@ -1123,10 +1476,9 @@ static void atv_nvidia_gpu_realize(PCIDevice *pci_dev, Error **errp)
  *
  * The restore-write then re-creates the mappings, which is why this has to go
  * through pci_default_write_config() and not a raw poke of the config space.
+ *
+ * The three base addresses themselves live next to the size defines above.
  */
-#define ATV_NVIDIA_REG_BASE  0x21000000
-#define ATV_NVIDIA_FB_BASE   0x10000000
-#define ATV_NVIDIA_INST_BASE 0x20000000
 
 static const struct {
     uint8_t off;
@@ -1212,8 +1564,8 @@ static void atv_nvidia_gpu_class_init(ObjectClass *klass, const void *data)
     k->config_write = atv_nvidia_config_write;
     k->vendor_id = PCI_VENDOR_ID_NVIDIA;
     k->device_id = ATV_NVIDIA_DEVICE_G72M;
-    k->subsystem_vendor_id = PCI_VENDOR_ID_NVIDIA;
-    k->subsystem_id = ATV_NVIDIA_DEVICE_G72M;
+    k->subsystem_vendor_id = PCI_VENDOR_ID_APPLE;
+    k->subsystem_id = 0x0081;      /* "AppleTV" GPU board, per real lspci */
     k->revision = 0xa1;
     k->class_id = PCI_CLASS_DISPLAY_VGA;
     device_class_set_legacy_reset(dc, atv_nvidia_gpu_reset);
