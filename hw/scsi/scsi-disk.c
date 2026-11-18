@@ -39,6 +39,7 @@
 #include "hw/block/block.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
+#include "hw/core/cpu.h"
 #include "system/dma.h"
 #include "system/system.h"
 #include "qemu/cutils.h"
@@ -2326,6 +2327,15 @@ static int32_t scsi_disk_dma_command(SCSIRequest *req, uint8_t *buf)
     case READ_12:
     case READ_16:
         trace_scsi_disk_dma_command_READ(r->req.cmd.lba, len);
+        if (getenv("ATV_TRACE_READ")) {
+            CPUState *cs = qemu_get_cpu(0);
+            vaddr pc = 0;
+            if (cs && cs->cc && cs->cc->get_pc) {
+                pc = cs->cc->get_pc(cs);
+            }
+            fprintf(stderr, "ATV READ lba=%" PRId64 " len=%u eip=%08x\n",
+                     (int64_t)r->req.cmd.lba, len, (unsigned)pc);
+        }
         /* Protection information is not supported.  For SCSI versions 2 and
          * older (as determined by snooping the guest's INQUIRY commands),
          * there is no RD/WR/VRPROTECT, so skip this check in these versions.
