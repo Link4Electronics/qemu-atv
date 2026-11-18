@@ -43,14 +43,36 @@ struct MemoryRegionPortioList {
 #define TYPE_MEMORY_REGION_PORTIO_LIST "memory-region-portio-list"
 OBJECT_DECLARE_SIMPLE_TYPE(MemoryRegionPortioList, MEMORY_REGION_PORTIO_LIST)
 
+static bool atv_ioport_log;
+
+static void atv_ioport_log_init(void)
+{
+    static int done;
+
+    if (!done) {
+        done = 1;
+        atv_ioport_log = getenv("ATV_IOPORT_LOG") != NULL;
+    }
+}
+
 static uint64_t unassigned_io_read(void *opaque, hwaddr addr, unsigned size)
 {
+    atv_ioport_log_init();
+    if (atv_ioport_log) {
+        fprintf(stderr, "atv-ioport: read  port=0x%04" HWADDR_PRIx " size=%u\n",
+                addr, size);
+    }
     return -1ULL;
 }
 
 static void unassigned_io_write(void *opaque, hwaddr addr, uint64_t val,
                                 unsigned size)
 {
+    atv_ioport_log_init();
+    if (atv_ioport_log) {
+        fprintf(stderr, "atv-ioport: write port=0x%04" HWADDR_PRIx " size=%u"
+                " val=0x%" PRIx64 "\n", addr, size, val);
+    }
 }
 
 const MemoryRegionOps unassigned_io_ops = {
