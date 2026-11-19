@@ -362,6 +362,15 @@ void helper_rdmsr(CPUX86State *env)
     case MSR_VM_HSAVE_PA:
         val = env->vm_hsave;
         break;
+    case MSR_IA32_EBL_CR_POWERON:
+        /* Pentium M (Dothan): 100 MHz FSB strap and a bus ratio of 10. */
+        if (((env->cpuid_version >> 8) & 0xf) == 6 &&
+            ((env->cpuid_version >> 4) & 0xf) == 0xd) {
+            val = (2ULL << 18) | (10ULL << 22);
+        } else {
+            val = 0;
+        }
+        break;
     case MSR_IA32_PERF_STATUS:
         /* tsc_increment_by_tick */
         val = 1000ULL;

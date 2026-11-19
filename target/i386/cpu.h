@@ -479,6 +479,8 @@ typedef enum X86Seg {
 
 #define MSR_IA32_PERF_STATUS            0x198
 
+#define MSR_IA32_EBL_CR_POWERON         0x2a
+
 #define MSR_IA32_MISC_ENABLE            0x1a0
 /* Indicates good rep/movs microcode on some processors: */
 #define MSR_IA32_MISC_ENABLE_DEFAULT    1

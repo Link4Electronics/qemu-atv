@@ -1189,6 +1189,28 @@ void pc_memory_init(PCMachineState *pcms,
         memory_region_add_subregion(system_memory, 0xfed14000,
                                     &atv_stub.mchbar);
 
+        /* ATV_MCHBAR_SEED=<file>: preload the 4 KiB MCHBAR image captured from
+         * real hardware (CLKCFG/DFT_STRAP1/CAPID/DRAM timings).  The stub is
+         * otherwise all-zero, so any strap the firmware reads back comes from
+         * here; everything the firmware programs still overwrites it, which is
+         * what makes a write-replay-vs-hardware diff meaningful. */
+        {
+            const char *seed = getenv("ATV_MCHBAR_SEED");
+            if (seed != NULL) {
+                gsize len = 0;
+                gchar *buf = NULL;
+                GError *err = NULL;
+
+                if (g_file_get_contents(seed, &buf, &len, &err)) {
+                    memcpy(atv_stub.mch, buf, MIN(len, sizeof(atv_stub.mch)));
+                    g_free(buf);
+                } else {
+                    error_report("ATV_MCHBAR_SEED: %s", err->message);
+                    g_error_free(err);
+                }
+            }
+        }
+
         memory_region_init_io(&atv_stub.pmt, OBJECT(pcms), &atv_pmt_ops,
                               NULL, "atv-pmtimer", 0x40);
         memory_region_add_subregion(get_system_io(), 0x400, &atv_stub.pmt);
